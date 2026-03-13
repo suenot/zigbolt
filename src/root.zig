@@ -62,6 +62,36 @@ pub const RawSubscriber = @import("api/subscriber.zig").RawSubscriber;
 pub const Transport = @import("api/transport.zig").Transport;
 pub const TransportConfig = @import("api/transport.zig").TransportConfig;
 
+// ── Archive ──────────────────────────────────────────────────
+pub const archive = struct {
+    pub const segment = @import("archive/segment.zig");
+    pub const core = @import("archive/archive.zig");
+    pub const Segment = segment.Segment;
+    pub const SegmentManager = segment.SegmentManager;
+    pub const Archive = core.Archive;
+    pub const ArchiveConfig = core.ArchiveConfig;
+};
+
+// ── Sequencer (Total Ordering) ───────────────────────────────
+pub const sequencer_mod = @import("sequencer/sequencer.zig");
+pub const Sequencer = sequencer_mod.Sequencer;
+pub const MultiStreamSequencer = sequencer_mod.MultiStreamSequencer;
+pub const SequenceIndex = sequencer_mod.SequenceIndex;
+pub const SequencedEvent = sequencer_mod.SequencedEvent;
+
+// ── Cluster (Raft Consensus) ────────────────────────────────
+pub const cluster = struct {
+    pub const RaftLog = @import("cluster/raft_log.zig").RaftLog;
+    pub const LogEntry = @import("cluster/raft_log.zig").LogEntry;
+    pub const RaftNode = @import("cluster/raft.zig").RaftNode;
+    pub const RaftConfig = @import("cluster/raft.zig").RaftConfig;
+    pub const RaftMessage = @import("cluster/raft.zig").RaftMessage;
+    pub const NodeState = @import("cluster/raft.zig").NodeState;
+    pub const Cluster = @import("cluster/cluster.zig").Cluster;
+    pub const ClusterConfig = @import("cluster/cluster.zig").ClusterConfig;
+    pub const StateMachine = @import("cluster/cluster.zig").StateMachine;
+};
+
 // ── Re-export key types for convenience ──────────────────────
 pub const SharedRegion = platform.memory.SharedRegion;
 pub const MemoryConfig = platform.memory.MemoryConfig;

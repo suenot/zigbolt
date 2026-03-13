@@ -1,16 +1,35 @@
-# Project Documentation
+# ZigBolt — Ultra-Low Latency Messaging System for HFT
+
+## Build & Test
+- `zig build` — build all targets
+- `zig build test` — run all unit tests
+- `zig build bench` — run IPC ping-pong benchmark
+- `./zig-out/bin/bench_throughput` — throughput benchmark
+- `./zig-out/bin/bench_udp_rtt` — UDP RTT benchmark
+- Zig version: 0.15.1
 
 ## Architecture
-## Workflow
-
-*   Before starting complex tasks, check `.claude/plans/` for existing plans and save new plans there
-*   Periodically use `sidecar_tasks` MCP tool to check pending tasks (do NOT use built-in TaskList — it is unrelated)
-*   Sidecar MCP tools (`sidecar_tasks`, `sidecar_scan`, `sidecar_map`, `docs_search`, `docs_get`, `docs_list`, `docs_reindex`, `mcp_list_servers`) are called directly — they are NOT deferred tools, do NOT search for them via ToolSearch
-*   After major changes, use sidecar tools: `sidecar_scan` to review docs, `sidecar_map` to update project map
-*   Read `.claude/rules/` for project-specific coding guidelines before making changes
-*   Keep CLAUDE.md under 200 lines — move detailed rules to `.claude/rules/*.md`
-*   When working with external APIs, databases, browsers, or new tools — check if a relevant MCP plugin exists: use `mcp_list_servers` to see what's configured, or `sidecar_tasks` to browse plugins via `make -C .claude dashboard` (Plugin Browser tab)
-*   Use `docs_search` to find relevant guides in: cmdop-claude bundled docs. Call `docs_get` with the returned path to read the full file.
+```
+src/
+├── platform/          # OS abstraction (mmap, config)
+├── core/              # Lock-free data structures (SPSC, MPSC, LogBuffer, Frame)
+├── codec/             # Comptime wire codec (zero-copy packed struct encode/decode)
+├── channel/           # IPC (shared memory), UDP, reliability, fragmentation, network
+├── api/               # Publisher, Subscriber, Transport
+├── ffi/               # C ABI exports for Rust/Python/C interop
+├── archive/           # Segment-based recording and replay
+├── cluster/           # Raft consensus (leader election, log replication)
+└── sequencer/         # Total ordering for capital markets
+bench/                 # Benchmarks with HDR histogram
+```
 
 ## Key Rules
-- This file was auto-generated from project scan — review and refine
+- Zig 0.15.1 API: use `std.Thread.sleep()` not `std.time.sleep()`, `std.debug.print()` for output
+- `std.io.getStdOut()` does NOT exist in 0.15.1
+- mmap PROT flags: use `posix.PROT.READ | posix.PROT.WRITE` (integer OR, not struct)
+- mmap MAP flags: use struct syntax `.{ .TYPE = .SHARED }`
+- shm_open: use `std.c.shm_open(name, @bitCast(std.c.O{ ... }), mode)`
+- mmap returns slice — use `.ptr` for multi-pointer fields
+- Cache line size: `std.atomic.cache_line` = 128 bytes (both aarch64 and x86_64)
+- Atomics: `std.atomic.Value(T)` with `.acquire`/`.release` ordering
+- All hot-path memory pre-allocated via mmap, zero allocations after init

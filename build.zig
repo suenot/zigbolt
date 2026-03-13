@@ -55,4 +55,16 @@ pub fn build(b: *std.Build) void {
         .root_module = throughput_mod,
     });
     b.installArtifact(throughput);
+
+    const udp_rtt_mod = b.createModule(.{
+        .root_source_file = b.path("bench/udp_rtt.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    udp_rtt_mod.addImport("zigbolt", lib_mod);
+    const udp_rtt = b.addExecutable(.{
+        .name = "bench_udp_rtt",
+        .root_module = udp_rtt_mod,
+    });
+    b.installArtifact(udp_rtt);
 }

@@ -33,6 +33,27 @@ pub const OrderMessage = @import("codec/wire.zig").OrderMessage;
 pub const IpcChannel = @import("channel/ipc.zig").IpcChannel;
 pub const IpcConfig = @import("channel/ipc.zig").IpcConfig;
 
+// ── UDP Channel ─────────────────────────────────────────────
+pub const UdpChannel = @import("channel/udp.zig").UdpChannel;
+pub const UdpConfig = @import("channel/udp.zig").UdpConfig;
+pub const NetworkChannel = @import("channel/network.zig").NetworkChannel;
+pub const NetworkConfig = @import("channel/network.zig").NetworkConfig;
+
+// ── Reliability Protocol ─────────────────────────────────────
+pub const reliability = @import("channel/reliability.zig");
+pub const NetworkHeader = reliability.NetworkHeader;
+pub const NakMessage = reliability.NakMessage;
+pub const SendBuffer = reliability.SendBuffer;
+pub const RecvTracker = reliability.RecvTracker;
+pub const FlowControl = reliability.FlowControl;
+
+// ── Fragment Layer ───────────────────────────────────────────
+pub const fragment = @import("channel/fragment.zig");
+pub const Fragmenter = fragment.Fragmenter;
+pub const Reassembler = fragment.Reassembler;
+pub const FragmentConfig = fragment.FragmentConfig;
+pub const FragmentHeader_ = fragment.FragmentHeader;
+
 // ── Publisher / Subscriber API ───────────────────────────────
 pub const Publisher = @import("api/publisher.zig").Publisher;
 pub const RawPublisher = @import("api/publisher.zig").RawPublisher;

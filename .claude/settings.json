@@ -1,0 +1,27 @@
+{
+  "plansDirectory": ".claude/plans",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m cmdop_claude.sidecar.hook map-update"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m cmdop_claude.sidecar.hook inject-tasks"
+          }
+        ]
+      }
+    ]
+  }
+}

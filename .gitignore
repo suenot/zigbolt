@@ -1,0 +1,11 @@
+zig-out/
+.zig-cache/
+*.o
+*.a
+*.so
+*.dylib
+
+# temp test binaries
+test_mmap*
+test_shm*
+test_io*

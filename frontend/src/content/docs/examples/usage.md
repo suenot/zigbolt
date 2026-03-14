@@ -1,4 +1,7 @@
-# ZigBolt Usage Examples
+---
+title: Usage Examples
+description: Practical examples for every ZigBolt subsystem
+---
 
 Practical examples showing how to use each major ZigBolt subsystem.
 

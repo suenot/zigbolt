@@ -1,7 +1,7 @@
 //! ZigBolt — Ultra-Low Latency Messaging System for HFT
 //!
-//! A high-performance messaging library designed as a direct competitor
-//! to Aeron (Real Logic / Adaptive) for high-frequency trading.
+//! A pure-Zig, zero-allocation, lock-free messaging library
+//! for high-frequency trading systems.
 //!
 //! Key features:
 //! - Zero-runtime-overhead (no GC, no JVM safepoints)

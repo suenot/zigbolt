@@ -1,4 +1,7 @@
-# ZigBolt Benchmarks
+---
+title: Benchmarks
+description: ZigBolt benchmark methodology, results, and performance targets
+---
 
 This document describes the benchmark methodology, how to run each benchmark,
 and the target performance numbers.

@@ -1,0 +1,81 @@
+---
+title: ZigBolt
+description: Ultra-Low Latency Messaging System for High-Frequency Trading
+template: splash
+hero:
+  tagline: A pure-Zig, zero-allocation, lock-free messaging system for high-frequency trading. Zero GC pauses, zero JVM safepoints, zero runtime overhead.
+  image:
+    file: ../../assets/zigbolt-logo-dark.svg
+  actions:
+    - text: Get Started
+      link: /getting-started/introduction/
+      icon: right-arrow
+      variant: primary
+    - text: API Reference
+      link: /reference/api-reference/
+      variant: minimal
+    - text: GitHub
+      link: https://github.com/suenot/zigbolt
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, Badge } from '@astrojs/starlight/components';
+
+## Key Performance Numbers
+
+<CardGrid>
+  <Card title="< 200ns IPC Latency" icon="rocket">
+    Shared memory channels with cache-line-padded atomics deliver sub-200ns p50 round-trip latency.
+  </Card>
+  <Card title="Zero Copy" icon="document">
+    Messages decoded in-place via pointer cast. No serialization overhead on the hot path.
+  </Card>
+  <Card title="100M+ msg/sec" icon="star">
+    Comptime wire codecs achieve 100M+ encode/decode operations per second.
+  </Card>
+  <Card title="~100 KB Binary" icon="seti:zig">
+    Entire library compiles to ~100 KB. No JVM, no runtime, no garbage collector.
+  </Card>
+</CardGrid>
+
+## Features
+
+<CardGrid>
+  <Card title="Lock-Free Buffers" icon="list-format">
+    SPSC (acquire/release atomics) and MPSC (CAS two-phase commit) ring buffers. 1-to-N broadcast buffer for market data fan-out.
+  </Card>
+  <Card title="SBE Codec" icon="puzzle">
+    FIX-standard Simple Binary Encoding with groups, vardata, and comptime schemas. NewOrderSingle, ExecutionReport, MarketData messages built-in.
+  </Card>
+  <Card title="Aeron-Compatible Protocol" icon="setting">
+    Wire protocol flyweights (DataHeader, StatusMessage, NAK, Setup, RTT, Error). AIMD congestion control. Min/Max/Tagged flow control.
+  </Card>
+  <Card title="Raft Consensus" icon="approve-check-circle">
+    Leader election, log replication, write-ahead log with CRC32 validation, snapshots, and crash recovery.
+  </Card>
+  <Card title="Archive & Replay" icon="open-book">
+    Segment-based message recording. Catalog with time/stream queries. Sparse index. LZ4-style compression.
+  </Card>
+  <Card title="Cross-Language FFI" icon="translate">
+    C-ABI shared library exports for C, Rust, and Python integration.
+  </Card>
+</CardGrid>
+
+## Comparison
+
+| Feature | ZigBolt | Aeron | Chronicle Queue | ZeroMQ |
+|---------|---------|-------|-----------------|--------|
+| Language | Zig | Java/C++ | Java | C |
+| IPC Latency (p50) | < 200 ns | ~200 ns | ~1 us | ~10 us |
+| SBE Codec | Native | XML codegen | Chronicle Wire | No |
+| GC Pauses | None | JVM GC | JVM GC | None |
+| Reliability | NAK-based | NAK-based | Replication | REQ/REP |
+| Cluster | Raft | Raft | Enterprise | None |
+| Binary Size | ~100 KB | ~20 MB | ~50 MB | ~1 MB |
+
+## Links
+
+- [Reforms.AI](https://reforms.ai) -- AI-driven market reform research
+- [Marketmaker.cc](https://marketmaker.cc) -- Market making tools and strategies
+- [StockAPIs.com](https://stockapis.com) -- Real-time market data APIs

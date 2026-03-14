@@ -1,0 +1,36 @@
+:root {
+	--sl-color-accent-low: #1a0f00;
+	--sl-color-accent: #f7931a;
+	--sl-color-accent-high: #ffd280;
+	--sl-color-white: #ffffff;
+	--sl-color-gray-1: #eceef2;
+	--sl-color-gray-2: #c0c2c7;
+	--sl-color-gray-3: #888b96;
+	--sl-color-gray-4: #545861;
+	--sl-color-gray-5: #353841;
+	--sl-color-gray-6: #24272f;
+	--sl-color-black: #17181c;
+	--sl-font-system-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #fff3e0;
+	--sl-color-accent: #e85d04;
+	--sl-color-accent-high: #7a3200;
+}
+
+/* Hero section styling */
+.hero-section {
+	text-align: center;
+	padding: 2rem 0;
+}
+
+/* Performance badge colors */
+.sl-badge {
+	font-family: var(--sl-font-system-mono);
+}
+
+/* Code block styling */
+pre {
+	border: 1px solid var(--sl-color-gray-5);
+}

@@ -1,4 +1,8 @@
-# ZigBolt API Reference
+---
+title: API Reference
+description: Complete API reference for all ZigBolt modules
+---
+
 
 All public types are exported from `src/root.zig` and accessible via
 `@import("zigbolt")`.

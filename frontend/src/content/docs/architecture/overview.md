@@ -1,4 +1,7 @@
-# ZigBolt Architecture
+---
+title: Architecture
+description: ZigBolt internal architecture, module dependencies, and data flows
+---
 
 This document describes the internal architecture of ZigBolt, covering module
 dependencies, data structures, memory layouts, threading model, and data flow.
@@ -545,9 +548,9 @@ Offset  Size     Field          Description
 12      8        index          u64: Raft log index
 20      variable payload        Entry data
 20+N    4        crc32          u32: CRC32 over term + index + payload
+```
 
 Total per-entry overhead: 24 bytes.
-```
 
 Sync policies: `every_entry` (safest), `every_n_entries` (batched), `explicit`.
 Recovery: sequential scan, CRC validation, truncation of corrupt tail.

@@ -3,8 +3,7 @@
 [![Zig 0.15.1](https://img.shields.io/badge/Zig-0.15.1-orange)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-ZigBolt is a high-performance messaging library written in Zig, designed as a
-direct competitor to [Aeron](https://github.com/real-logic/aeron) for
+ZigBolt is a pure-Zig, zero-allocation, lock-free messaging library for
 high-frequency trading systems. Zero GC pauses, zero JVM safepoints, zero
 runtime overhead.
 

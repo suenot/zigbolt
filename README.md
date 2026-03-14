@@ -12,14 +12,26 @@ runtime overhead.
 
 - **Sub-100ns IPC latency** -- shared memory channels with cache-line-padded atomics
 - **Zero-copy** -- messages decoded in-place via pointer cast, no serialization overhead
-- **Comptime wire codecs** -- `WireCodec(T)` validates packed structs at compile time, replacing SBE
+- **Comptime wire codecs** -- `WireCodec(T)` validates packed structs at compile time
+- **SBE codec** -- FIX-standard Simple Binary Encoding with groups, vardata, and comptime schemas
+- **FIX/SBE messages** -- NewOrderSingle, ExecutionReport, MarketDataIncrementalRefresh, MassQuote, Heartbeat, Logon
+- **Wire protocol flyweights** -- Aeron-compatible DataHeader, StatusMessage, NAK, Setup, RTT, Error frames
 - **Lock-free ring buffers** -- SPSC (acquire/release atomics) and MPSC (CAS two-phase commit)
+- **Broadcast buffer** -- 1-to-N fan-out for market data (one producer, many consumers, lossy)
 - **NAK-based reliability** -- receiver-driven retransmission with gap detection bitmap
-- **Credit-based flow control** -- prevents sender from overwhelming slow receivers
+- **AIMD congestion control** -- TCP-like slow start / congestion avoidance with RTT estimation
+- **Flow control strategies** -- Min (reliable multicast), Max (best-effort), Tagged (group-based)
 - **Fragmentation/reassembly** -- transparent large-message support over UDP
+- **Idle strategies** -- BusySpin, Yielding, Sleeping, Backoff for adaptive CPU/latency trade-offs
+- **Agent pattern** -- composable threaded agents with lifecycle management and duty cycle tracking
+- **Shared counters** -- atomic counter system for monitoring all subsystems (IPC, network, cluster, etc.)
 - **Raft consensus cluster** -- leader election, log replication, state machine application
+- **Write-ahead log** -- CRC32-validated persistent WAL with crash recovery and truncation
+- **Raft snapshots** -- point-in-time state snapshots with CRC validation and cleanup
 - **Total-order sequencer** -- monotonic sequence assignment across multiple input streams
 - **Message archive** -- segment-based record/replay with stream filtering
+- **Archive catalog & index** -- segment metadata catalog with time/stream queries and sparse index
+- **LZ4-style compression** -- hash-table-based compression for archive segments
 - **C/Rust/Python FFI** -- shared library with C-ABI exports
 
 ## Architecture
@@ -113,10 +125,24 @@ zig build && ./zig-out/bin/bench_udp_rtt
 | **Publisher** | `src/api/publisher.zig` | Typed pub API via WireCodec over IpcChannel |
 | **Subscriber** | `src/api/subscriber.zig` | Typed sub API via WireCodec over IpcChannel |
 | **Transport** | `src/api/transport.zig` | Channel manager, factory for publishers/subscribers |
+| **SbeEncoder/Decoder** | `src/codec/sbe.zig` | SBE wire format engine with comptime schema definitions |
+| **FIX Messages** | `src/codec/fix_messages.zig` | FIX/SBE market data messages (NewOrderSingle, ExecutionReport, etc.) |
+| **DataHeaderFlyweight** | `src/protocol/flyweight.zig` | Aeron-compatible wire protocol flyweights (Data, SM, NAK, Setup, RTT, Error) |
+| **BroadcastBuffer** | `src/core/broadcast.zig` | 1-to-N broadcast (BroadcastTransmitter, BroadcastReceiver, CopyBroadcastReceiver) |
+| **IdleStrategy** | `src/core/idle_strategy.zig` | Idle strategies (BusySpin, Yielding, Sleeping, Backoff, NoOp) |
+| **AgentRunner** | `src/core/agent.zig` | Agent pattern (AgentFn, AgentRunner, CompositeAgent, DutyCycleTracker) |
+| **CounterSet** | `src/core/counters.zig` | Shared atomic counter system (Counter, CounterSet, GlobalCounters) |
+| **CongestionControl** | `src/channel/congestion.zig` | AIMD congestion control with RTT estimation and NAK controller |
+| **FlowControl** | `src/channel/flow_control.zig` | Flow control strategies (Min, Max, Tagged) with receiver tracking |
 | **Archive** | `src/archive/archive.zig` | Segment-based message recording and replay |
+| **Catalog** | `src/archive/catalog.zig` | Archive catalog with time/stream queries and disk persistence |
+| **SparseIndex** | `src/archive/index.zig` | Sparse index for fast record lookup within segments |
+| **Compressor** | `src/archive/compression.zig` | LZ4-style compression/decompression with framed format |
 | **Sequencer** | `src/sequencer/sequencer.zig` | Atomic total-order sequence assignment |
 | **RaftNode** | `src/cluster/raft.zig` | Raft consensus: election, replication, commit |
 | **Cluster** | `src/cluster/cluster.zig` | High-level Raft cluster with state machine |
+| **WriteAheadLog** | `src/cluster/wal.zig` | CRC32-validated WAL with crash recovery and truncation |
+| **SnapshotManager** | `src/cluster/snapshot.zig` | Raft snapshots with CRC validation and old snapshot cleanup |
 | **FFI** | `src/ffi/exports.zig` | C-ABI exports for cross-language integration |
 
 ## Code Examples
@@ -249,12 +275,15 @@ Results are printed with HDR histogram percentiles (p50, p90, p99, p99.9, p99.99
 |---------|---------|-------|-----------------|--------|----------------|
 | Language | Zig | Java/C++ | Java | C | Java |
 | IPC Latency (p50) | < 200 ns | ~200 ns | ~1 us | ~10 us | ~100 ns |
+| SBE Codec | Yes (native) | SBE (XML codegen) | Chronicle Wire | No | N/A |
 | Zero-Copy Decode | Yes (comptime) | SBE codegen | Chronicle Wire | No | N/A |
 | GC Pauses | None | JVM GC | JVM GC | None | JVM GC |
 | Lock-Free Buffers | SPSC/MPSC | SPSC/MPMC | Appender | Lock-based | Ring buffer |
 | Reliability | NAK-based | NAK-based | Replication | REQ/REP | N/A |
 | Cluster Consensus | Raft | Raft (Aeron Cluster) | Enterprise Repl. | None | None |
-| Wire Codec | Comptime WireCodec | SBE (XML codegen) | Chronicle Wire | Protobuf/etc | Custom |
+| Wire Codec | WireCodec + SBE | SBE (XML codegen) | Chronicle Wire | Protobuf/etc | Custom |
+| Flow Control | Min/Max/Tagged | Min/Max/Tagged | N/A | HWM | N/A |
+| Broadcast Buffer | Yes (1-to-N) | Yes (1-to-N) | No | PUB/SUB | No |
 | Archive/Replay | Segment-based | Archive | Chronicle Queue | None | None |
 | Binary Size | ~100 KB | ~20 MB (JVM) | ~50 MB (JVM) | ~1 MB | ~10 MB (JVM) |
 | Build Dependency | Zig compiler | JVM + Gradle | JVM + Maven | CMake | JVM + Gradle |
@@ -349,14 +378,24 @@ zigbolt/
       spsc.zig           # SPSC ring buffer
       mpsc.zig           # MPSC ring buffer (CAS)
       log_buffer.zig     # Triple-buffered log (term rotation)
+      broadcast.zig      # 1-to-N broadcast buffer (transmitter/receiver)
+      idle_strategy.zig  # Idle strategies (BusySpin, Yielding, Sleeping, Backoff)
+      agent.zig          # Agent pattern (AgentRunner, CompositeAgent, DutyCycleTracker)
+      counters.zig       # Shared atomic counter system (Counter, CounterSet, GlobalCounters)
     codec/
       wire.zig           # Comptime wire codec + TickMessage/OrderMessage
+      sbe.zig            # SBE wire format engine (MessageHeader, GroupHeader, Encoder, Decoder)
+      fix_messages.zig   # FIX/SBE market data messages (NewOrderSingle, ExecutionReport, etc.)
+    protocol/
+      flyweight.zig      # Aeron-compatible wire protocol flyweights (Data, SM, NAK, Setup, RTT, Error)
     channel/
       ipc.zig            # Shared-memory IPC channel
       udp.zig            # UDP unicast/multicast channel
       network.zig        # Reliable network channel
       reliability.zig    # NAK protocol, SendBuffer, RecvTracker, FlowControl
       fragment.zig       # Fragmentation / reassembly
+      congestion.zig     # AIMD congestion control with RTT estimation
+      flow_control.zig   # Flow control strategies (Min, Max, Tagged)
     api/
       publisher.zig      # Typed Publisher(T) and RawPublisher
       subscriber.zig     # Typed Subscriber(T) and RawSubscriber
@@ -364,12 +403,17 @@ zigbolt/
     archive/
       segment.zig        # Segment file management
       archive.zig        # Record/replay engine
+      catalog.zig        # Archive catalog (segment metadata, time/stream queries)
+      index.zig          # Sparse index for fast record lookup
+      compression.zig    # LZ4-style compression/decompression
     sequencer/
       sequencer.zig      # Sequencer, MultiStreamSequencer, SequenceIndex
     cluster/
       raft.zig           # Raft consensus node
       raft_log.zig       # Raft replicated log
       cluster.zig        # Cluster with state machine
+      wal.zig            # Write-Ahead Log (CRC32-validated, crash recovery)
+      snapshot.zig       # Raft snapshots (point-in-time state capture)
     ffi/
       exports.zig        # C-ABI function exports
   bench/

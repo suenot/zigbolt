@@ -20,6 +20,20 @@ All public types are exported from `src/root.zig` and accessible via
 - [Archive](#archive)
 - [Sequencer](#sequencer)
 - [Cluster (Raft Consensus)](#cluster-raft-consensus)
+- [Write-Ahead Log](#write-ahead-log)
+- [Snapshots](#snapshots)
+- [SBE Codec](#sbe-codec)
+- [FIX Messages](#fix-messages)
+- [Wire Protocol Flyweights](#wire-protocol-flyweights)
+- [Broadcast Buffer](#broadcast-buffer)
+- [Idle Strategies](#idle-strategies)
+- [Agent Pattern](#agent-pattern)
+- [Counters](#counters)
+- [Congestion Control](#congestion-control)
+- [Flow Control](#flow-control)
+- [Archive Catalog](#archive-catalog)
+- [Archive Index](#archive-index)
+- [Compression](#compression)
 - [FFI Exports](#ffi-exports)
 
 ---
@@ -689,6 +703,612 @@ High-level cluster that wraps RaftNode and a StateMachine.
 | `tick` | `fn tick(self: *Cluster) void` | Apply committed entries to state machine |
 | `isLeader` | `fn isLeader(self) bool` | Check leadership |
 | `getState` | `fn getState(self) NodeState` | Current Raft state |
+
+---
+
+## Write-Ahead Log
+
+### `WriteAheadLog`
+
+Persistent WAL for Raft consensus. Each entry is CRC32-validated on disk.
+
+```zig
+var wal = try WriteAheadLog.init(allocator, .{
+    .path = "zigbolt_raft.wal",
+    .sync_policy = .every_n_entries,
+    .sync_interval = 100,
+});
+defer wal.deinit();
+```
+
+**WalConfig**:
+```zig
+pub const WalConfig = struct {
+    path: []const u8 = "zigbolt_raft.wal",
+    sync_policy: SyncPolicy = .every_n_entries,
+    sync_interval: u32 = 100,
+};
+pub const SyncPolicy = enum { every_entry, every_n_entries, explicit };
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(allocator: Allocator, config: WalConfig) !WriteAheadLog` | Create or open a WAL file |
+| `deinit` | `fn deinit(self: *WriteAheadLog) void` | Sync and close |
+| `append` | `fn append(self, term: u64, index: u64, data: []const u8) !void` | Append a CRC32-validated entry |
+| `readEntry` | `fn readEntry(self, log_index: u64) !?WalEntry` | Read entry by log index |
+| `truncateFrom` | `fn truncateFrom(self, from_index: u64) !void` | Remove entries >= from_index |
+| `recover` | `fn recover(self) ![]WalEntry` | Scan file, rebuild index, return valid entries |
+| `flush` | `fn flush(self) !void` | Force fsync to disk |
+| `lastIndex` | `fn lastIndex(self) u64` | Last written log index |
+| `lastTerm` | `fn lastTerm(self) u64` | Term of last entry |
+| `entryCount` | `fn entryCount(self) u64` | Number of entries |
+
+**WalEntry**:
+```zig
+pub const WalEntry = struct {
+    term: u64,
+    index: u64,
+    data: []const u8,
+};
+```
+
+### `VoteState`
+
+Persistent Raft vote state (16-byte file).
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `save` | `fn save(self: VoteState, path: []const u8) !void` | Atomically save to file |
+| `load` | `fn load(path: []const u8) !?VoteState` | Load from file, null if missing |
+
+---
+
+## Snapshots
+
+### `SnapshotManager`
+
+Manages Raft snapshots on disk with CRC32 validation.
+
+```zig
+var mgr = SnapshotManager.init(allocator, .{
+    .base_path = "/var/lib/zigbolt/snapshots",
+    .snapshot_interval = 10000,
+});
+defer mgr.deinit();
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(allocator: Allocator, config: SnapshotConfig) SnapshotManager` | Initialize |
+| `deinit` | `fn deinit(self: *SnapshotManager) void` | Cleanup |
+| `shouldSnapshot` | `fn shouldSnapshot(self) bool` | True if interval reached |
+| `onEntryCommitted` | `fn onEntryCommitted(self) void` | Track committed entries |
+| `takeSnapshot` | `fn takeSnapshot(self, last_term: u64, last_index: u64, state_data: []const u8) !void` | Write snapshot to disk |
+| `loadLatestSnapshot` | `fn loadLatestSnapshot(self) !?SnapshotData` | Load newest snapshot |
+| `getLatestMeta` | `fn getLatestMeta(self) ?SnapshotMeta` | Metadata without loading state |
+| `cleanOldSnapshots` | `fn cleanOldSnapshots(self, keep_count: usize) !void` | Delete all but N newest |
+
+**SnapshotData** (caller must call `deinit()`):
+```zig
+pub const SnapshotData = struct {
+    last_included_term: u64,
+    last_included_index: u64,
+    data: []u8,
+    allocator: std.mem.Allocator,
+    pub fn deinit(self: *SnapshotData) void;
+};
+```
+
+---
+
+## SBE Codec
+
+### `SbeEncoder`
+
+Encodes SBE messages into caller-provided byte buffers. Zero heap allocations.
+
+```zig
+var buf: [4096]u8 = undefined;
+var enc = SbeEncoder.init(&buf);
+const hdr_pos = try enc.putMessageHeader(42, 1, 1);
+try enc.putU64(timestamp);
+try enc.putI64(price);
+enc.finishHeader(hdr_pos);
+const wire_bytes = buf[0..enc.encodedLength()];
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(buf: []u8) SbeEncoder` | Initialize over buffer |
+| `encodedLength` | `fn encodedLength(self) usize` | Bytes written so far |
+| `putMessageHeader` | `fn putMessageHeader(self, template_id: u16, schema_id: u16, version: u16) !usize` | Write 8-byte header, returns position for `finishHeader` |
+| `finishHeader` | `fn finishHeader(self, header_pos: usize) void` | Patch block_length after root fields |
+| `putU8`..`putU64` | `fn putU64(self, val: u64) !void` | Write unsigned integers |
+| `putI8`..`putI64` | `fn putI64(self, val: i64) !void` | Write signed integers |
+| `putF32`/`putF64` | `fn putF64(self, val: f64) !void` | Write floats |
+| `putChar` | `fn putChar(self, val: u8) !void` | Write character |
+| `putBytes` | `fn putBytes(self, data: []const u8) !void` | Write fixed-length bytes |
+| `putEnum` | `fn putEnum(self, comptime E: type, val: E) !void` | Write enum as integer |
+| `beginGroup` | `fn beginGroup(self, block_length: u16, count: u16) !void` | Write group header |
+| `putVarData` | `fn putVarData(self, data: []const u8) !void` | Write [u32 len][data] |
+
+### `SbeDecoder`
+
+Zero-copy SBE decoder. Returns pointers directly into the underlying buffer.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(buf: []const u8) SbeDecoder` | Initialize over buffer |
+| `position` | `fn position(self) usize` | Current read position |
+| `remaining` | `fn remaining(self) usize` | Bytes left |
+| `skip` | `fn skip(self, n: usize) !void` | Advance position |
+| `getMessageHeader` | `fn getMessageHeader(self) !MessageHeader` | Read 8-byte header |
+| `getGroupHeader` | `fn getGroupHeader(self) !GroupHeader` | Read 4-byte group header |
+| `getU8`..`getU64` | `fn getU64(self) !u64` | Read unsigned integers |
+| `getI8`..`getI64` | `fn getI64(self) !i64` | Read signed integers |
+| `getF32`/`getF64` | `fn getF64(self) !f64` | Read floats |
+| `getBytes` | `fn getBytes(self, comptime N: usize) !*const [N]u8` | Zero-copy fixed bytes |
+| `getBytesSlice` | `fn getBytesSlice(self, n: usize) ![]const u8` | Zero-copy runtime-length bytes |
+| `getEnum` | `fn getEnum(self, comptime E: type) !E` | Read enum |
+| `getVarData` | `fn getVarData(self) ![]const u8` | Zero-copy variable-length data |
+
+### `Decimal64`
+
+Fixed-point decimal for financial prices. Only the mantissa is transmitted on the wire.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `fromFloat` | `fn fromFloat(val: f64, exp: i8) Decimal64` | Construct from float |
+| `toFloat` | `fn toFloat(self) f64` | Convert to f64 |
+| `isNull` | `fn isNull(self) bool` | Check null sentinel |
+| `nullValue` | `fn nullValue() Decimal64` | Create null sentinel |
+
+---
+
+## FIX Messages
+
+SBE-encoded FIX protocol messages in `src/codec/fix_messages.zig`.
+
+### Enum Types
+
+```zig
+pub const Side = enum(u8) { buy = 1, sell = 2 };
+pub const OrdType = enum(u8) { market = 1, limit = 2, stop = 3, stop_limit = 4 };
+pub const TimeInForce = enum(u8) { day = 0, gtc = 1, ioc = 3, gtd = 6 };
+pub const ExecType = enum(u8) { new = 0, fill = 1, partial_fill = 2, canceled = 4, rejected = 8 };
+pub const OrdStatus = enum(u8) { new = 0, partially_filled = 1, filled = 2, canceled = 4, rejected = 8 };
+pub const MDUpdateAction = enum(u8) { new = 0, change = 1, delete = 2 };
+pub const MDEntryType = enum(u8) { bid = 0, offer = 1, trade = 2 };
+```
+
+### Fixed-Block Messages
+
+| Message | Template ID | Block Size | Fields |
+|---------|-------------|------------|--------|
+| `NewOrderSingle` | 1 | 57 bytes | cl_ord_id, account, symbol, side, transact_time, order_qty, ord_type, price, stop_px, time_in_force |
+| `ExecutionReport` | 2 | 89 bytes | order_id, cl_ord_id, exec_id, ord_status, exec_type, symbol, side, leaves_qty, cum_qty, avg_px, transact_time, text_len |
+| `Heartbeat` | 5 | 16 bytes | test_req_id, timestamp_ns |
+| `Logon` | 6 | 20 bytes | heart_bt_int, encrypt_method, reset_seq_num_flag, timestamp_ns |
+
+### Group-Based Messages
+
+| Message | Template ID | Description |
+|---------|-------------|-------------|
+| `MarketDataIncrementalRefresh` | 3 | MD entries group (action, type, symbol, price, size, etc.) |
+| `MassQuote` | 4 | Quote sets group, each with nested quote entries |
+
+Each group-based message provides an `encode()` method (returns `SbeEncoder` for streaming)
+and a `decode()` method (returns `SbeDecoder` positioned after the root block).
+
+---
+
+## Wire Protocol Flyweights
+
+Aeron-compatible flyweights in `src/protocol/flyweight.zig`. Each wraps a `[]u8` buffer.
+
+### `DataHeaderFlyweight` (32 bytes)
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `wrap` | `fn wrap(buf: []u8) DataHeaderFlyweight` | Wrap existing buffer |
+| `init` | `fn init(buf: []u8) DataHeaderFlyweight` | Wrap and set type=DATA |
+| `frameLength`/`setFrameLength` | `i32` | Total frame size |
+| `flags`/`setFlags` | `u8` | BEGIN/END/EOS flags |
+| `termOffset`/`setTermOffset` | `u32` | Offset in term |
+| `sessionId`/`setSessionId` | `i32` | Session identifier |
+| `streamId`/`setStreamId` | `i32` | Stream identifier |
+| `termId`/`setTermId` | `i32` | Term identifier |
+| `reservedValue`/`setReservedValue` | `i64` | User metadata |
+| `payload` | `fn payload(self) []u8` | Payload region after header |
+| `isBeginMessage`/`isEndMessage`/`isEndOfStream` | `bool` | Flag checks |
+
+### `StatusMessageFlyweight` (36 bytes)
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `sessionId`/`streamId` | `i32` | Identifiers |
+| `consumptionTermId`/`consumptionTermOffset` | `i32` | Consumption position |
+| `receiverWindowLength` | `i32` | Advertised window |
+| `receiverId` | `i64` | Unique receiver ID |
+
+### `NakFlyweight` (28 bytes)
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `sessionId`/`streamId`/`termId` | `i32` | Identifiers |
+| `termOffset` | `i32` | Start of missing range |
+| `nakLength` | `i32` | Length of missing range |
+
+### `SetupFlyweight` (40 bytes), `RttMeasurementFlyweight` (40 bytes), `ErrorFlyweight` (28+ bytes)
+
+All follow the same pattern: `wrap(buf)`, `init(buf)`, typed getters/setters.
+
+### Position Helpers
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `computePosition` | `fn computePosition(term_offset, term_id, shift, initial_term_id) i64` | Absolute position from term addressing |
+| `computeTermIdFromPosition` | `fn computeTermIdFromPosition(position, shift, initial_term_id) i32` | Term ID from position |
+| `computeTermOffsetFromPosition` | `fn computeTermOffsetFromPosition(position, shift) i32` | Offset from position |
+
+---
+
+## Broadcast Buffer
+
+### `BroadcastTransmitter`
+
+Single-producer transmitter for 1-to-N messaging.
+
+```zig
+var buf: [1024 + TRAILER_LENGTH]u8 align(cache_line_size) = [_]u8{0} ** (1024 + TRAILER_LENGTH);
+var tx = BroadcastTransmitter.init(&buf);
+tx.transmit(42, "market data update");
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(buf: []u8) BroadcastTransmitter` | Initialize (capacity must be power of 2) |
+| `transmit` | `fn transmit(self, msg_type_id: i32, msg: []const u8) void` | Transmit a message (always succeeds, old data overwritten) |
+| `calculateMaxMessageLength` | `fn calculateMaxMessageLength(self) u32` | Max payload size: `(capacity / 8) - 8` |
+
+### `BroadcastReceiver`
+
+Per-consumer receiver. Each maintains its own cursor.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(buf: []const u8) BroadcastReceiver` | Join from current tail position |
+| `receiveNext` | `fn receiveNext(self) ?Message` | Read next message, or null if none |
+| `validate` | `fn validate(self) bool` | Check data not overwritten |
+| `lappedCount` | `fn lappedCount(self) u64` | Times receiver was lapped |
+
+### `CopyBroadcastReceiver`
+
+Wrapper that copies payload to internal scratch buffer for safe retention.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(buf: []const u8) CopyBroadcastReceiver` | Initialize |
+| `receiveNext` | `fn receiveNext(self) ?Message` | Receive with copy to scratch |
+| `lappedCount` | `fn lappedCount(self) u64` | Times lapped |
+
+---
+
+## Idle Strategies
+
+### `IdleStrategy`
+
+Tagged union dispatching to concrete strategies via `idle(work_count)` and `reset()`.
+
+```zig
+var strategy = idle_strategy.backoff();
+strategy.idle(0);  // no work -> back off
+strategy.idle(1);  // work done -> reset to active
+```
+
+| Strategy | Latency | CPU | Description |
+|----------|---------|-----|-------------|
+| `BusySpinIdleStrategy` | Lowest | Highest | Hardware PAUSE instruction |
+| `YieldingIdleStrategy` | Low | High | `Thread.yield()` |
+| `SleepingIdleStrategy` | Medium | Low | `Thread.sleep(N)` |
+| `BackoffIdleStrategy` | Adaptive | Adaptive | NOT_IDLE -> SPINNING -> YIELDING -> PARKING |
+| `NoOpIdleStrategy` | N/A | N/A | Does nothing |
+
+Convenience constructors: `busySpin()`, `yielding()`, `sleeping(ns)`, `backoff()`, `noOp()`.
+
+---
+
+## Agent Pattern
+
+### `AgentFn`
+
+Function-pointer-based agent interface for composable units of work.
+
+```zig
+pub const AgentFn = struct {
+    doWorkFn: *const fn (ctx: *anyopaque) u32,   // returns work count
+    onStartFn: ?*const fn (ctx: *anyopaque) void, // lifecycle start
+    onCloseFn: ?*const fn (ctx: *anyopaque) void, // lifecycle close
+    ctx: *anyopaque,
+    name: []const u8,
+};
+```
+
+### `AgentRunner`
+
+Runs an agent on a dedicated thread with an idle strategy.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(agent: AgentFn, idle: IdleStrategy) AgentRunner` | Create runner |
+| `start` | `fn start(self) !void` | Start agent on new thread |
+| `stop` | `fn stop(self) void` | Stop agent and join thread |
+| `isRunning` | `fn isRunning(self) bool` | Check if running |
+| `errorCount` | `fn errorCount(self) u64` | Error counter |
+
+### `CompositeAgent`
+
+Combines multiple agents. Returns sum of work from all sub-agents.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(agents: []const AgentFn) CompositeAgent` | Create composite |
+| `agentFn` | `fn agentFn(self) AgentFn` | Get AgentFn interface |
+
+### `DutyCycleTracker`
+
+Measures cycle performance for monitoring and tuning.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `cycleStart` | `fn cycleStart(self) void` | Record cycle start |
+| `cycleEnd` | `fn cycleEnd(self, work_count: u32) void` | Record cycle end |
+| `averageCycleNs` | `fn averageCycleNs(self) u64` | Recent cycle duration |
+| `workRatio` | `fn workRatio(self) f64` | Ratio of busy vs idle cycles (0.0--1.0) |
+
+---
+
+## Counters
+
+### `Counter`
+
+Lightweight atomic i64 counter handle for hot-path instrumentation.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `increment` | `fn increment(self) void` | Atomic +1 (monotonic) |
+| `incrementBy` | `fn incrementBy(self, n: i64) void` | Atomic +n |
+| `decrement` | `fn decrement(self) void` | Atomic -1 |
+| `get` | `fn get(self) i64` | Load (acquire) |
+| `set` | `fn set(self, val: i64) void` | Store (release) |
+| `getAndReset` | `fn getAndReset(self) i64` | Swap to 0 (acq_rel) |
+
+### `CounterSet`
+
+Fixed-capacity set of named atomic counters (max 64).
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init() CounterSet` | Zero-initialized set |
+| `allocate` | `fn allocate(self, counter_type: CounterType, name: []const u8) ?Counter` | Allocate counter slot |
+| `getByType` | `fn getByType(self, counter_type: CounterType) ?Counter` | Look up by type |
+| `forEach` | `fn forEach(self, callback) void` | Iterate all active counters |
+| `snapshot` | `fn snapshot(self, out: []CounterSnapshot) u32` | Copy all values |
+| `resetAll` | `fn resetAll(self) void` | Reset all to zero |
+
+### `GlobalCounters`
+
+System-wide registry organized by subsystem (IPC, Network, Reliability, Archive, Cluster, Sequencer, System).
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init() GlobalCounters` | Empty counter sets |
+| `initWithDefaults` | `fn initWithDefaults() GlobalCounters` | Pre-register all standard counters |
+| `formatReport` | `fn formatReport(self, buf: []u8) []const u8` | Human-readable report |
+
+---
+
+## Congestion Control
+
+### `CongestionControl`
+
+AIMD congestion control with slow start and congestion avoidance phases.
+
+```zig
+var cc = CongestionControl.init(.{
+    .initial_window = 64 * 1024,
+    .max_window = 16 * 1024 * 1024,
+    .min_window = 4 * 1024,
+    .mss = 1460,
+    .initial_ssthresh = 1024 * 1024,
+});
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(cfg: CongestionConfig) CongestionControl` | Initialize |
+| `onAck` | `fn onAck(self, bytes_acked: u64) void` | Window increase (slow start or CA) |
+| `onLoss` | `fn onLoss(self) void` | Multiplicative decrease |
+| `onTimeout` | `fn onTimeout(self) void` | Reset to min_window, re-enter slow start |
+| `canSend` | `fn canSend(self, bytes: u64) bool` | Check window allows sending |
+| `onSend` | `fn onSend(self, bytes: u64) void` | Record bytes in flight |
+| `availableWindow` | `fn availableWindow(self) u64` | Bytes available in window |
+
+### `RttEstimator`
+
+RFC 6298 EWMA-based RTT estimation.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init() RttEstimator` | Initialize (1s initial RTO) |
+| `update` | `fn update(self, rtt_ns: u64) void` | Record RTT sample |
+| `retransmitTimeout` | `fn retransmitTimeout(self) u64` | Current RTO (ns) |
+| `smoothedRtt` | `fn smoothedRtt(self) u64` | Current SRTT (ns) |
+
+### `NakController`
+
+Exponential backoff for NAK timing.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(config: NakConfig) NakController` | Initialize |
+| `shouldSendNak` | `fn shouldSendNak(self, now_ns: u64) bool` | Check if enough time elapsed |
+| `onNakSent` | `fn onNakSent(self, now_ns: u64) void` | Record NAK sent, increase backoff |
+| `onGapFilled` | `fn onGapFilled(self) void` | Reset state for reuse |
+| `isExhausted` | `fn isExhausted(self) bool` | Max retransmits exceeded |
+| `currentDelay` | `fn currentDelay(self) u64` | Current delay with backoff (ns) |
+
+---
+
+## Flow Control
+
+### `FlowControl`
+
+Unified flow control dispatching to Min, Max, or Tagged strategy.
+
+```zig
+var fc = FlowControl.init(.{ .strategy = .min, .receiver_timeout_ns = 5_000_000_000 });
+const new_limit = fc.onStatusMessage(status, sender_limit, initial_term_id, shift, now_ns);
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(cfg: FlowControlConfig) FlowControl` | Create from config |
+| `onStatusMessage` | `fn onStatusMessage(self, status, sender_limit, initial_term_id, shift, now_ns) i64` | Process receiver status, return new sender limit |
+| `onIdle` | `fn onIdle(self, now_ns, sender_limit, sender_position, is_eos) i64` | Remove stale receivers, return current limit |
+| `hasRequiredReceivers` | `fn hasRequiredReceivers(self) bool` | Check for active receivers |
+
+### `MinFlowControl`
+
+Sender limit = minimum position across all active receivers. Guarantees no receiver left behind.
+
+### `MaxFlowControl`
+
+Sender always advances. No back-pressure. Suitable for market data where stale quotes are worthless.
+
+### `TaggedFlowControl`
+
+Only receivers matching `required_group_tag` constrain the sender. Untagged receivers are tracked but do not limit.
+
+### `ReceiverStatus`
+
+```zig
+pub const ReceiverStatus = struct {
+    session_id: i32,
+    stream_id: i32,
+    consumption_term_id: i32,
+    consumption_term_offset: i32,
+    receiver_window_length: i32,
+    receiver_id: i64,
+    timestamp_ns: u64,
+};
+```
+
+---
+
+## Archive Catalog
+
+### `Catalog`
+
+Tracks segment metadata with time-range and stream queries.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(allocator: Allocator, base_path: []const u8) !Catalog` | Initialize |
+| `deinit` | `fn deinit(self: *Catalog) void` | Free entries |
+| `addEntry` | `fn addEntry(self, entry: CatalogEntry) !void` | Add segment metadata |
+| `updateEntry` | `fn updateEntry(self, segment_id: u32, entry: CatalogEntry) !void` | Update existing |
+| `getEntry` | `fn getEntry(self, segment_id: u32) ?CatalogEntry` | Look up by ID |
+| `findByTimestamp` | `fn findByTimestamp(self, from_ns: u64, to_ns: u64) []const CatalogEntry` | Time range query |
+| `findByStream` | `fn findByStream(self, stream_id: u32) ![]CatalogEntry` | Stream filter (caller frees) |
+| `save` | `fn save(self) !void` | Persist to disk |
+| `load` | `fn load(allocator: Allocator, path: []const u8) !Catalog` | Load from disk |
+| `totalRecords` | `fn totalRecords(self) u64` | Sum of record counts |
+| `totalBytes` | `fn totalBytes(self) u64` | Sum of payload bytes |
+| `segmentCount` | `fn segmentCount(self) u32` | Number of segments |
+
+**CatalogEntry** (56 bytes serialized):
+```zig
+pub const CatalogEntry = struct {
+    segment_id: u32,
+    start_offset: u64,
+    end_offset: u64,
+    start_timestamp_ns: u64,
+    end_timestamp_ns: u64,
+    stream_id: u32,
+    record_count: u32,
+    total_bytes: u64,
+    closed: bool,
+};
+```
+
+---
+
+## Archive Index
+
+### `SparseIndex`
+
+Indexes every Nth record for fast binary-search lookup within segments.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(allocator: Allocator, segment_id: u32, interval: u32) SparseIndex` | Initialize |
+| `deinit` | `fn deinit(self: *SparseIndex) void` | Free entries |
+| `record` | `fn record(self, seq: u32, offset: u64, timestamp_ns: u64, stream_id: u32) !void` | Record an entry (indexes every Nth) |
+| `findByTimestamp` | `fn findByTimestamp(self, timestamp_ns: u64) ?IndexEntry` | Binary search by timestamp |
+| `findBySequence` | `fn findBySequence(self, record_seq: u32) ?IndexEntry` | Binary search by sequence |
+| `save` | `fn save(self, base_path: []const u8) !void` | Save to disk |
+| `load` | `fn load(allocator: Allocator, base_path: []const u8, segment_id: u32) !SparseIndex` | Load from disk |
+| `rebuild` | `fn rebuild(allocator, segment_file, segment_id, interval) !SparseIndex` | Rebuild by scanning segment |
+
+**IndexEntry** (24 bytes serialized):
+```zig
+pub const IndexEntry = struct {
+    record_seq: u32,
+    file_offset: u64,
+    timestamp_ns: u64,
+    stream_id: u32,
+};
+```
+
+---
+
+## Compression
+
+### `Compressor`
+
+LZ4-style compression with hash-table-based matching. 64 KB sliding window.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `init` | `fn init(allocator: Allocator) !Compressor` | Allocate hash table |
+| `deinit` | `fn deinit(self, allocator: Allocator) void` | Free hash table |
+| `compress` | `fn compress(self, src: []const u8, dst: []u8) !usize` | Compress into buffer, returns bytes written |
+| `maxCompressedSize` | `fn maxCompressedSize(input_size: usize) usize` | Worst-case output size |
+
+### `Decompressor`
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `decompress` | `fn decompress(src: []const u8, dst: []u8) !usize` | Decompress, returns bytes written |
+
+### Frame API
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `compressFrame` | `fn compressFrame(allocator, src: []const u8) ![]u8` | Compress with 16-byte header + CRC32 |
+| `decompressFrame` | `fn decompressFrame(allocator, frame_data: []const u8) ![]u8` | Decompress and validate checksum |
+
+**CompressedFrame** (16-byte header):
+```zig
+pub const CompressedFrame = struct {
+    magic: u32,           // 0x5A424C5A ("ZBLZ")
+    original_size: u32,
+    compressed_size: u32,
+    checksum: u32,        // CRC32 of original data
+};
+```
 
 ---
 

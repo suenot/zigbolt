@@ -164,7 +164,7 @@ pub const timestampNs = platform.config.timestampNs;
 
 // ── Version Info ─────────────────────────────────────────────
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 1;
+pub const version_minor: u32 = 2;
 pub const version_patch: u32 = 0;
 
 // ── Tests ────────────────────────────────────────────────────
@@ -175,6 +175,6 @@ test {
 test "version constants" {
     const testing = @import("std").testing;
     try testing.expectEqual(@as(u32, 0), version_major);
-    try testing.expectEqual(@as(u32, 1), version_minor);
+    try testing.expectEqual(@as(u32, 2), version_minor);
     try testing.expectEqual(@as(u32, 0), version_patch);
 }

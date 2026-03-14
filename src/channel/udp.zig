@@ -282,3 +282,68 @@ test "UdpChannel non-blocking recv returns null when no data" {
 
     try std.testing.expect(result == null);
 }
+
+test "UdpChannel socket creation and deinit" {
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    var ch = try UdpChannel.init(.{
+        .bind_address = bind_addr,
+        .non_blocking = true,
+        .send_buffer_size = 1024 * 1024,
+        .recv_buffer_size = 1024 * 1024,
+    });
+    defer ch.deinit();
+
+    // Socket fd should be valid (non-negative)
+    try std.testing.expect(ch.socket_fd >= 0);
+}
+
+test "UdpChannel multiple send/recv" {
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    var ch = try UdpChannel.init(.{
+        .bind_address = bind_addr,
+        .non_blocking = true,
+    });
+    defer ch.deinit();
+
+    // Discover actual port
+    var bound_addr: posix.sockaddr align(4) = undefined;
+    var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    const rc = std.c.getsockname(ch.socket_fd, &bound_addr, &bound_len);
+    if (rc != 0) return error.GetSockNameFailed;
+    const actual_addr = net.Address.initPosix(&bound_addr);
+
+    // Send multiple messages
+    _ = try ch.send("first", actual_addr);
+    _ = try ch.send("second", actual_addr);
+
+    var buf: [256]u8 = undefined;
+    var count: u32 = 0;
+
+    for (0..200) |_| {
+        const result = try ch.recv(&buf);
+        if (result != null) {
+            count += 1;
+            if (count >= 2) break;
+        }
+        std.Thread.sleep(50_000);
+    }
+
+    try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "UdpChannel send requires destination" {
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    var ch = try UdpChannel.init(.{
+        .bind_address = bind_addr,
+        .non_blocking = true,
+        .remote_address = null,
+    });
+    defer ch.deinit();
+
+    // Sending without a destination and no remote_address should fail
+    const result = ch.send("test", null);
+    try std.testing.expectError(error.DestinationRequired, result);
+}

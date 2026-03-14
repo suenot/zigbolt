@@ -29,14 +29,17 @@ pub fn SpscRingBuffer(comptime capacity: usize) type {
         head: std.atomic.Value(usize) align(config.cache_line_size) = std.atomic.Value(usize).init(0),
 
         // Padding to push tail to the next cache line.
-        _pad0: [config.cache_line_size - @sizeOf(std.atomic.Value(usize))]u8 = undefined,
+        _pad0: [config.cache_line_size - @sizeOf(std.atomic.Value(usize))]u8 = [_]u8{0} ** (config.cache_line_size - @sizeOf(std.atomic.Value(usize))),
 
         // Tail (read position) — on its own cache line.
         tail: std.atomic.Value(usize) align(config.cache_line_size) = std.atomic.Value(usize).init(0),
 
-        _pad1: [config.cache_line_size - @sizeOf(std.atomic.Value(usize))]u8 = undefined,
+        _pad1: [config.cache_line_size - @sizeOf(std.atomic.Value(usize))]u8 = [_]u8{0} ** (config.cache_line_size - @sizeOf(std.atomic.Value(usize))),
 
         buffer: [capacity]u8 align(config.cache_line_size) = [_]u8{0} ** capacity,
+
+        // Scratch buffer used when a read payload wraps around the ring boundary.
+        _scratch: [capacity]u8 = undefined,
 
         /// Create an initialized ring buffer with the buffer zeroed.
         pub fn init() Self {
@@ -51,7 +54,7 @@ pub fn SpscRingBuffer(comptime capacity: usize) type {
             const payload_len: u32 = @intCast(data.len);
             const total_len: usize = frame.alignedFrameLength(payload_len);
 
-            const head_pos = self.head.load(.acquire);
+            const head_pos = self.head.load(.monotonic);
             const tail_pos = self.tail.load(.acquire);
 
             // Available space: capacity minus currently used bytes.
@@ -118,38 +121,34 @@ pub fn SpscRingBuffer(comptime capacity: usize) type {
 
             // Return a slice view into the ring buffer for the payload.
             // Because the buffer wraps, we need to check whether the payload
-            // is contiguous. For simplicity (and because capacity is large
-            // relative to typical messages), we copy into a small stack
-            // buffer when wrapping occurs. However, to keep this zero-copy
-            // for the common case, we return a direct slice when contiguous.
+            // is contiguous. For the common case we return a direct slice;
+            // when wrapping occurs we copy into _scratch byte-by-byte.
             const payload_start = (tail_pos + @sizeOf(frame.FrameHeader)) & mask;
             const payload_end = payload_start + payload_len;
 
-            // Advance the tail past the entire aligned frame.
-            self.tail.store(tail_pos + total_len, .release);
-
             if (payload_end <= capacity) {
                 // Contiguous — return direct slice.
-                return ReadResult{
+                const result = ReadResult{
                     .data = self.buffer[payload_start .. payload_start + payload_len],
                     .msg_type_id = header.msg_type_id,
                 };
+                // Advance the tail past the entire aligned frame.
+                self.tail.store(tail_pos + total_len, .release);
+                return result;
             } else {
-                // Wrapped — this is the uncommon path. The caller must
-                // consume or copy the data before the next write overwrites
-                // it. We return the first contiguous part; callers needing
-                // full wrap support should use a larger buffer or a
-                // two-phase read API. For now return first part up to end.
-                //
-                // NOTE: in a production system you would provide a
-                // scatter-gather read or copy into a caller-supplied buffer.
-                // Here we return the contiguous prefix; the payload_len in
-                // ReadResult reflects the full length for the caller to be
-                // aware of wrapping.
-                return ReadResult{
-                    .data = self.buffer[payload_start..capacity],
+                // Wrapped — copy the full payload through the mask into _scratch.
+                var read_pos = tail_pos + @sizeOf(frame.FrameHeader);
+                for (0..payload_len) |i| {
+                    self._scratch[i] = self.buffer[read_pos & mask];
+                    read_pos += 1;
+                }
+                const result = ReadResult{
+                    .data = self._scratch[0..payload_len],
                     .msg_type_id = header.msg_type_id,
                 };
+                // Advance the tail past the entire aligned frame.
+                self.tail.store(tail_pos + total_len, .release);
+                return result;
             }
         }
     };
@@ -219,8 +218,7 @@ test "wrap-around" {
     var rb = SpscRingBuffer(Cap).init();
 
     // Fill then drain several times to force head/tail past capacity.
-    for (0..10) |round| {
-        _ = round;
+    for (0..10) |_| {
         // Each "test" payload is 4 bytes → frame = alignUp(8+4,8) = 16 bytes.
         // 128 / 16 = 8 frames fit.
         for (0..8) |_| {
@@ -232,10 +230,7 @@ test "wrap-around" {
         // Drain all.
         var n: usize = 0;
         while (rb.read()) |res| {
-            // Only check contiguous reads (non-wrapped).
-            if (res.data.len == 4) {
-                try std.testing.expectEqualStrings("test", res.data);
-            }
+            try std.testing.expectEqualStrings("test", res.data);
             try std.testing.expectEqual(@as(i32, 7), res.msg_type_id);
             n += 1;
         }

@@ -464,3 +464,86 @@ test "FlowControl credit consume and replenish" {
     try std.testing.expect(fc.tryConsume(250));
     try std.testing.expectEqual(@as(i64, 250), fc.available());
 }
+
+test "SendBuffer get returns null for empty buffer" {
+    const allocator = std.testing.allocator;
+    var buf = try SendBuffer.init(allocator, 8);
+    defer buf.deinit(allocator);
+
+    try std.testing.expect(buf.get(0) == null);
+    try std.testing.expect(buf.get(1) == null);
+    try std.testing.expect(buf.get(7) == null);
+}
+
+test "SendBuffer store advances next_sequence" {
+    const allocator = std.testing.allocator;
+    var buf = try SendBuffer.init(allocator, 8);
+    defer buf.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 0), buf.next_sequence);
+
+    try buf.store(0, "a", allocator);
+    try std.testing.expectEqual(@as(u64, 1), buf.next_sequence);
+
+    try buf.store(5, "b", allocator);
+    try std.testing.expectEqual(@as(u64, 6), buf.next_sequence);
+}
+
+test "RecvTracker contiguous receive no gaps" {
+    const allocator = std.testing.allocator;
+    var tracker = try RecvTracker.init(allocator, 64);
+    defer tracker.deinit();
+
+    // Receive 0, 1, 2, 3 in order — no gaps
+    for (0..4) |i| {
+        const gap = tracker.recordReceived(i);
+        try std.testing.expect(gap == null);
+    }
+    try std.testing.expectEqual(@as(u64, 4), tracker.next_expected);
+
+    const missing = try tracker.getMissing(allocator);
+    defer allocator.free(missing);
+    try std.testing.expectEqual(@as(usize, 0), missing.len);
+}
+
+test "RecvTracker duplicate and old sequences" {
+    const allocator = std.testing.allocator;
+    var tracker = try RecvTracker.init(allocator, 64);
+    defer tracker.deinit();
+
+    _ = tracker.recordReceived(0);
+    _ = tracker.recordReceived(1);
+    try std.testing.expectEqual(@as(u64, 2), tracker.next_expected);
+
+    // Receiving an old/duplicate sequence should not regress next_expected
+    _ = tracker.recordReceived(0);
+    try std.testing.expectEqual(@as(u64, 2), tracker.next_expected);
+}
+
+test "RecvTracker slideWindow" {
+    const allocator = std.testing.allocator;
+    var tracker = try RecvTracker.init(allocator, 64);
+    defer tracker.deinit();
+
+    _ = tracker.recordReceived(0);
+    _ = tracker.recordReceived(1);
+    _ = tracker.recordReceived(2);
+
+    tracker.slideWindow(2);
+    try std.testing.expectEqual(@as(u64, 2), tracker.bitmap_base);
+}
+
+test "FlowControl zero window" {
+    var fc = FlowControl.init(0);
+    try std.testing.expectEqual(@as(i64, 0), fc.available());
+    try std.testing.expect(!fc.tryConsume(1));
+
+    fc.replenish(100);
+    try std.testing.expectEqual(@as(i64, 100), fc.available());
+    try std.testing.expect(fc.tryConsume(100));
+    try std.testing.expect(!fc.tryConsume(1));
+}
+
+test "NakMessage layout" {
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(NakMessage));
+}

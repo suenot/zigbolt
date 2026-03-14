@@ -51,3 +51,46 @@ pub inline fn isDataFrame(frame_length: i32) bool {
 pub inline fn isUncommitted(frame_length: i32) bool {
     return frame_length == 0;
 }
+
+// ── Tests ────────────────────────────────────────────────────
+
+const std = @import("std");
+const testing = std.testing;
+
+test "FrameHeader size and layout" {
+    try testing.expectEqual(@as(usize, 8), @sizeOf(FrameHeader));
+    try testing.expectEqual(@as(u32, 8), FrameHeader.SIZE);
+}
+
+test "alignedFrameLength" {
+    // header(8) + 0 payload = 8, aligned to 8 = 8
+    try testing.expectEqual(@as(u32, 8), alignedFrameLength(0));
+    // header(8) + 1 payload = 9, aligned to 8 = 16
+    try testing.expectEqual(@as(u32, 16), alignedFrameLength(1));
+    // header(8) + 8 payload = 16, aligned to 8 = 16
+    try testing.expectEqual(@as(u32, 16), alignedFrameLength(8));
+    // header(8) + 9 payload = 17, aligned to 8 = 24
+    try testing.expectEqual(@as(u32, 24), alignedFrameLength(9));
+}
+
+test "isPaddingFrame, isDataFrame, isUncommitted" {
+    try testing.expect(isPaddingFrame(-1));
+    try testing.expect(isPaddingFrame(-100));
+    try testing.expect(!isPaddingFrame(0));
+    try testing.expect(!isPaddingFrame(1));
+
+    try testing.expect(isDataFrame(1));
+    try testing.expect(isDataFrame(100));
+    try testing.expect(!isDataFrame(0));
+    try testing.expect(!isDataFrame(-1));
+
+    try testing.expect(isUncommitted(0));
+    try testing.expect(!isUncommitted(1));
+    try testing.expect(!isUncommitted(-1));
+}
+
+test "FrameHeader default values" {
+    const hdr = FrameHeader{};
+    try testing.expectEqual(@as(i32, 0), hdr.frame_length);
+    try testing.expectEqual(@as(i32, 0), hdr.msg_type_id);
+}

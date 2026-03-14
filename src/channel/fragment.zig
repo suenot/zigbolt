@@ -372,3 +372,65 @@ test "reassembler rejects oversized messages" {
     const result = reassembler.processFragment(1, header, &payload);
     try std.testing.expectError(error.MessageTooLarge, result);
 }
+
+test "small message does not need fragmentation" {
+    const fragmenter = Fragmenter.init(.{ .mtu = 1472, .max_message_size = 1 << 20 });
+    try std.testing.expect(!fragmenter.needsFragmentation(10));
+    try std.testing.expect(!fragmenter.needsFragmentation(0));
+    try std.testing.expect(!fragmenter.needsFragmentation(1460)); // 1472 - 12 = 1460
+
+    // At exactly max payload per fragment, no fragmentation needed
+    const max_payload = fragmenter.maxPayloadPerFragment();
+    try std.testing.expect(!fragmenter.needsFragmentation(max_payload));
+
+    // One byte over needs fragmentation
+    try std.testing.expect(fragmenter.needsFragmentation(max_payload + 1));
+}
+
+test "reassembler single-fragment fast path" {
+    const allocator = std.testing.allocator;
+    const cfg = FragmentConfig{ .mtu = 1472, .max_message_size = 1 << 20 };
+    var reassembler = Reassembler.init(allocator, cfg);
+    defer reassembler.deinit();
+
+    const msg = "hello world";
+    const header = FragmentHeader{
+        .total_length = msg.len,
+        .fragment_offset = 0,
+        .fragment_length = @intCast(msg.len),
+        .flags = .{ .begin = true, .end = true },
+    };
+
+    const result = try reassembler.processFragment(1, header, msg);
+    try std.testing.expect(result != null);
+    defer allocator.free(result.?);
+    try std.testing.expectEqualStrings(msg, result.?);
+}
+
+test "reassembler rejects fragment out of bounds" {
+    const allocator = std.testing.allocator;
+    const cfg = FragmentConfig{ .mtu = 100, .max_message_size = 1 << 20 };
+    var reassembler = Reassembler.init(allocator, cfg);
+    defer reassembler.deinit();
+
+    const header = FragmentHeader{
+        .total_length = 10,
+        .fragment_offset = 5,
+        .fragment_length = 10,
+        .flags = .{},
+    };
+
+    var payload: [10]u8 = undefined;
+    @memset(&payload, 0);
+
+    const result = reassembler.processFragment(1, header, &payload);
+    try std.testing.expectError(error.FragmentOutOfBounds, result);
+}
+
+test "maxPayloadPerFragment calculation" {
+    const f1 = Fragmenter.init(.{ .mtu = 100 });
+    try std.testing.expectEqual(@as(u32, 88), f1.maxPayloadPerFragment()); // 100 - 12
+
+    const f2 = Fragmenter.init(.{ .mtu = 1472 });
+    try std.testing.expectEqual(@as(u32, 1460), f2.maxPayloadPerFragment()); // 1472 - 12
+}

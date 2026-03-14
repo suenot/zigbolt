@@ -23,13 +23,14 @@ pub const SequencerConfig = struct {
 pub const Sequencer = struct {
     next_sequence: std.atomic.Value(u64),
     config: SequencerConfig,
-    total_sequenced: u64,
+    /// Atomically updated count of total events sequenced. Thread-safe.
+    total_sequenced: std.atomic.Value(u64),
 
     pub fn init(config: SequencerConfig) Sequencer {
         return Sequencer{
             .next_sequence = std.atomic.Value(u64).init(config.initial_sequence),
             .config = config,
-            .total_sequenced = 0,
+            .total_sequenced = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -38,9 +39,7 @@ pub const Sequencer = struct {
     pub fn sequence(self: *Sequencer, stream_id: u32, payload: []const u8) SequencedEvent {
         const seq = self.next_sequence.fetchAdd(1, .monotonic);
         const ts = @as(u64, @intCast(std.time.nanoTimestamp()));
-        // Note: total_sequenced is not atomically updated; for exact counts
-        // across threads, use MultiStreamSequencer or external synchronization.
-        self.total_sequenced += 1;
+        _ = self.total_sequenced.fetchAdd(1, .monotonic);
         return SequencedEvent{
             .sequence = seq,
             .timestamp_ns = ts,
@@ -57,16 +56,23 @@ pub const Sequencer = struct {
     /// Reset the sequencer (for testing/replay).
     pub fn reset(self: *Sequencer, initial_sequence: u64) void {
         self.next_sequence.store(initial_sequence, .monotonic);
-        self.total_sequenced = 0;
+        self.total_sequenced.store(0, .monotonic);
     }
 };
 
 /// Multi-stream sequencer: merges N input streams into 1 sequenced output.
 /// Uses round-robin with optional weighting.
+///
+/// Thread-safety: single-threaded only. The `stream_stats` and `active_streams`
+/// fields are updated non-atomically for performance, assuming deterministic,
+/// single-threaded access. The underlying `Sequencer.sequence()` is thread-safe
+/// (atomic), but `sequenceFrom()` must be called from a single thread.
 pub const MultiStreamSequencer = struct {
     sequencer: Sequencer,
-    /// Per-stream statistics.
+    /// Per-stream statistics (single-threaded access only — not atomic).
     stream_stats: [64]StreamStats,
+    /// Number of distinct streams that have produced at least one event
+    /// (single-threaded access only — not atomic).
     active_streams: u32,
 
     pub const StreamStats = struct {
@@ -218,7 +224,7 @@ test "Sequencer: reset" {
     seq.reset(100);
 
     try std.testing.expectEqual(@as(u64, 100), seq.peekNextSequence());
-    try std.testing.expectEqual(@as(u64, 0), seq.total_sequenced);
+    try std.testing.expectEqual(@as(u64, 0), seq.total_sequenced.load(.monotonic));
 
     const e = seq.sequence(0, "after-reset");
     try std.testing.expectEqual(@as(u64, 100), e.sequence);

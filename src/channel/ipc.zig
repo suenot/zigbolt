@@ -104,11 +104,14 @@ pub const IpcChannel = struct {
         const aligned_len = frame.alignedFrameLength(payload_len);
         const tl: u32 = @intCast(self.term_length);
 
-        // Claim space
-        const tail = self.meta.tail_position.load(.monotonic);
-        const term_offset: u32 = @intCast(tail % self.term_length);
+        // Reject messages that can never fit in a single term.
+        if (aligned_len > tl) return error.MessageTooLarge;
 
-        // Check if frame fits in current term
+        // Claim space
+        var tail = self.meta.tail_position.load(.monotonic);
+        var term_offset: u32 = @intCast(tail % self.term_length);
+
+        // Check if frame fits in current term; if not, insert padding and rotate.
         if (term_offset + aligned_len > tl) {
             // Need to insert padding and rotate to next term
             const remaining = tl - term_offset;
@@ -123,7 +126,8 @@ pub const IpcChannel = struct {
             // Advance to next term boundary
             const new_tail = tail + (tl - term_offset);
             self.meta.tail_position.store(new_tail, .release);
-            return self.publish(data, msg_type_id);
+            tail = new_tail;
+            term_offset = 0;
         }
 
         // Write frame
@@ -177,8 +181,10 @@ pub const IpcChannel = struct {
                 continue;
             }
 
-            // Data frame
+            // Data frame — BUF-1: Validate payload_len against term bounds.
             const payload_len: u32 = @intCast(fl);
+            const tl_u32: u32 = @intCast(self.term_length);
+            if (payload_len > tl_u32 - term_offset - frame.FrameHeader.SIZE) break;
             const payload = (buf + frame.FrameHeader.SIZE)[0..payload_len];
             const hdr_type_ptr: *const i32 = @ptrCast(@alignCast(buf + 4));
 
@@ -220,4 +226,67 @@ test "IpcChannel create and publish" {
     }.handler, 10);
 
     try std.testing.expect(count >= 1);
+}
+
+test "IpcChannel publish/poll roundtrip verifies data" {
+    const name = "/zigbolt_test_ipc_rt";
+
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
+    defer ch.deinit();
+
+    try ch.publish("roundtrip test", 99);
+
+    const S = struct {
+        var received_data: ?[]const u8 = null;
+        var received_type: i32 = 0;
+        fn handler(result: IpcChannel.ReadResult) void {
+            received_data = result.data;
+            received_type = result.msg_type_id;
+        }
+    };
+
+    S.received_data = null;
+    S.received_type = 0;
+
+    const count = ch.poll(&S.handler, 10);
+    try std.testing.expectEqual(@as(u32, 1), count);
+    try std.testing.expect(S.received_data != null);
+    try std.testing.expectEqualStrings("roundtrip test", S.received_data.?);
+    try std.testing.expectEqual(@as(i32, 99), S.received_type);
+}
+
+test "IpcChannel multiple messages" {
+    const name = "/zigbolt_test_ipc_multi";
+
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
+    defer ch.deinit();
+
+    try ch.publish("msg1", 1);
+    try ch.publish("msg2", 2);
+    try ch.publish("msg3", 3);
+
+    const S = struct {
+        var msg_count: u32 = 0;
+        fn handler(_: IpcChannel.ReadResult) void {
+            msg_count += 1;
+        }
+    };
+
+    S.msg_count = 0;
+    const count = ch.poll(&S.handler, 10);
+    try std.testing.expectEqual(@as(u32, 3), count);
+    try std.testing.expectEqual(@as(u32, 3), S.msg_count);
+}
+
+test "IpcChannel empty poll returns zero" {
+    const name = "/zigbolt_test_ipc_empty";
+
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
+    defer ch.deinit();
+
+    const count = ch.poll(&struct {
+        fn handler(_: IpcChannel.ReadResult) void {}
+    }.handler, 10);
+
+    try std.testing.expectEqual(@as(u32, 0), count);
 }

@@ -53,3 +53,60 @@ comptime {
     std.debug.assert(page_size >= 4096);
     std.debug.assert(frame_alignment == 8);
 }
+
+// ── Tests ────────────────────────────────────────────────────
+
+test "timestampNs returns non-zero" {
+    const t1 = timestampNs();
+    try std.testing.expect(t1 > 0);
+}
+
+test "timestampNs is monotonic" {
+    const t1 = timestampNs();
+    const t2 = timestampNs();
+    try std.testing.expect(t2 >= t1);
+}
+
+test "alignUp basic cases" {
+    // Already aligned
+    try std.testing.expectEqual(@as(u32, 8), alignUp(8, 8));
+    try std.testing.expectEqual(@as(u32, 16), alignUp(16, 8));
+
+    // Needs rounding up
+    try std.testing.expectEqual(@as(u32, 8), alignUp(1, 8));
+    try std.testing.expectEqual(@as(u32, 8), alignUp(7, 8));
+    try std.testing.expectEqual(@as(u32, 16), alignUp(9, 8));
+    try std.testing.expectEqual(@as(u32, 16), alignUp(15, 8));
+
+    // Zero
+    try std.testing.expectEqual(@as(u32, 0), alignUp(0, 8));
+}
+
+test "alignUp with different alignments" {
+    try std.testing.expectEqual(@as(u32, 64), alignUp(33, 64));
+    try std.testing.expectEqual(@as(u32, 4096), alignUp(1, 4096));
+    try std.testing.expectEqual(@as(u32, 4096), alignUp(4096, 4096));
+    try std.testing.expectEqual(@as(u32, 8192), alignUp(4097, 4096));
+}
+
+test "constants have expected values" {
+    try std.testing.expect(cache_line_size >= 64);
+    try std.testing.expect(page_size >= 4096);
+    try std.testing.expectEqual(@as(u32, 8), frame_alignment);
+    try std.testing.expectEqual(@as(usize, 1 << 20), default_term_length);
+    try std.testing.expectEqual(@as(usize, 1 << 16), default_ring_capacity);
+    try std.testing.expectEqual(@as(usize, 3), default_num_terms);
+}
+
+test "platform detection is consistent" {
+    // Exactly one of Linux/macOS should be true (on supported platforms)
+    // or both can be false (on other platforms)
+    if (is_linux) {
+        try std.testing.expect(!is_macos);
+        try std.testing.expect(supports_hugepages);
+    }
+    if (is_macos) {
+        try std.testing.expect(!is_linux);
+        try std.testing.expect(!supports_hugepages);
+    }
+}

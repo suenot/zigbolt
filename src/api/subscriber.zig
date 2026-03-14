@@ -57,3 +57,39 @@ pub const RawSubscriber = struct {
         return self.channel.poll(handler, limit);
     }
 };
+
+// ── Tests ────────────────────────────────────────────────────
+
+test "RawSubscriber creation" {
+    const name = "/zigbolt_test_sub_raw";
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
+    defer ch.deinit();
+
+    const sub = RawSubscriber.init(&ch);
+    _ = sub;
+}
+
+test "RawSubscriber poll on empty channel" {
+    const name = "/zigbolt_test_sub_empty";
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
+    defer ch.deinit();
+
+    var sub = RawSubscriber.init(&ch);
+    const count = sub.poll(&struct {
+        fn handler(_: IpcChannel.ReadResult) void {}
+    }.handler, 10);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "Subscriber typed creation" {
+    const TestMsg = packed struct {
+        x: u64,
+    };
+
+    const name = "/zigbolt_test_sub_typed";
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
+    defer ch.deinit();
+
+    const sub = Subscriber(TestMsg).init(&ch, 5);
+    try std.testing.expectEqual(@as(i32, 5), sub.msg_type_id);
+}

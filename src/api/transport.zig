@@ -118,3 +118,37 @@ test "Transport basic lifecycle" {
     // Just verify init/deinit works without channels
     try std.testing.expect(transport.channels.count() == 0);
 }
+
+test "Transport creation with custom config" {
+    var transport = Transport.init(std.testing.allocator, .{
+        .term_length = 8192,
+        .use_hugepages = false,
+        .pre_fault = false,
+    });
+    defer transport.deinit();
+
+    try std.testing.expectEqual(@as(usize, 8192), transport.config.term_length);
+    try std.testing.expect(!transport.config.use_hugepages);
+    try std.testing.expect(!transport.config.pre_fault);
+}
+
+test "Transport addRawPublication creates channel" {
+    var transport = Transport.init(std.testing.allocator, .{ .term_length = 4096 });
+    defer transport.deinit();
+
+    var pub_inst = try transport.addRawPublication("/zigbolt_test_transport_pub", 42);
+    try pub_inst.offer("hello from transport");
+
+    try std.testing.expectEqual(@as(u32, 1), transport.channels.count());
+}
+
+test "Transport addRawPublication reuses channel" {
+    var transport = Transport.init(std.testing.allocator, .{ .term_length = 4096 });
+    defer transport.deinit();
+
+    _ = try transport.addRawPublication("/zigbolt_test_transport_reuse", 1);
+    _ = try transport.addRawPublication("/zigbolt_test_transport_reuse", 2);
+
+    // Same channel name should reuse the same channel
+    try std.testing.expectEqual(@as(u32, 1), transport.channels.count());
+}

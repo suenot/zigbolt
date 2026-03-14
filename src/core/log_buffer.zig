@@ -79,7 +79,7 @@ pub fn LogBuffer(comptime cfg: LogBufferConfig) type {
                     if (self.tail_position.cmpxchgWeak(
                         tail,
                         new_tail,
-                        .acquire,
+                        .acq_rel,
                         .monotonic,
                     )) |_| {
                         // CAS failed — another publisher won; retry.
@@ -102,7 +102,7 @@ pub fn LogBuffer(comptime cfg: LogBufferConfig) type {
                 if (self.tail_position.cmpxchgWeak(
                     tail,
                     new_tail,
-                    .acquire,
+                    .acq_rel,
                     .monotonic,
                 )) |_| {
                     continue;

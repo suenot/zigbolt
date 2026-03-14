@@ -32,7 +32,8 @@ pub const Segment = struct {
     max_size: usize,
 
     pub fn create(dir: std.fs.Dir, id: u64, max_size: usize) !Segment {
-        const filename = segmentFilenameSlice(id);
+        var name_buf: [32]u8 = undefined;
+        const filename = segmentFilename(&name_buf, id);
         const file = try dir.createFile(filename, .{ .read = true, .truncate = true });
         return Segment{
             .file = file,
@@ -43,7 +44,8 @@ pub const Segment = struct {
     }
 
     pub fn open(dir: std.fs.Dir, id: u64) !Segment {
-        const filename = segmentFilenameSlice(id);
+        var name_buf: [32]u8 = undefined;
+        const filename = segmentFilename(&name_buf, id);
         const file = try dir.openFile(filename, .{ .mode = .read_only });
         const file_size = try file.getEndPos();
         return Segment{
@@ -147,12 +149,8 @@ pub const Segment = struct {
         return self.write_offset + full_header_size + 1 > self.max_size;
     }
 
-    fn segmentFilenameSlice(id: u64) []const u8 {
-        const S = struct {
-            var buf: [32]u8 = undefined;
-        };
-        const slice = std.fmt.bufPrint(&S.buf, "segment_{d:0>10}.dat", .{id}) catch unreachable;
-        return slice;
+    fn segmentFilename(buf: *[32]u8, id: u64) []const u8 {
+        return std.fmt.bufPrint(buf, "segment_{d:0>10}.dat", .{id}) catch unreachable;
     }
 };
 

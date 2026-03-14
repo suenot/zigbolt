@@ -68,6 +68,10 @@ pub export fn zigbolt_publish(handle: ?*anyopaque, data: ?[*]const u8, len: u32,
 /// Fragment handler callback type for C FFI.
 pub const FragmentHandlerFn = *const fn (data: [*]const u8, len: u32, msg_type_id: i32) callconv(.c) void;
 
+/// Thread-local storage to pass the C callback into the Zig handler,
+/// since Zig comptime closures cannot capture runtime values.
+threadlocal var current_callback: ?FragmentHandlerFn = null;
+
 /// Poll for messages from an IPC channel.
 /// Returns the number of messages read.
 pub export fn zigbolt_poll(handle: ?*anyopaque, callback: ?FragmentHandlerFn, limit: u32) u32 {
@@ -75,14 +79,16 @@ pub export fn zigbolt_poll(handle: ?*anyopaque, callback: ?FragmentHandlerFn, li
     const cb = callback orelse return 0;
     const ch: *zigbolt.IpcChannel = @ptrCast(@alignCast(h));
 
+    current_callback = cb;
+    defer current_callback = null;
+
     const Handler = struct {
         fn dispatch(result: zigbolt.IpcChannel.ReadResult) void {
-            // Note: we can't capture `cb` here in Zig, so this is a placeholder.
-            // In a real FFI scenario, we'd use a different approach.
-            _ = result;
+            if (current_callback) |ffi_cb| {
+                ffi_cb(result.data.ptr, @intCast(result.data.len), result.msg_type_id);
+            }
         }
     };
-    _ = cb;
     return ch.poll(&Handler.dispatch, limit);
 }
 

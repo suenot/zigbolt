@@ -102,7 +102,8 @@ pub const NetworkChannel = struct {
     /// Handles reassembly, NAK generation, and heartbeat processing.
     /// Returns the number of complete messages delivered.
     pub fn poll(self: *NetworkChannel, handler: *const fn (data: []const u8) void, limit: u32) !u32 {
-        var buf: [65536]u8 = undefined;
+        // Align the recv buffer for safe header casting (NET-6, BUF-6).
+        var buf: [65536]u8 align(@alignOf(reliability.NetworkHeader)) = undefined;
         var count: u32 = 0;
 
         while (count < limit) {
@@ -115,10 +116,22 @@ pub const NetworkChannel = struct {
                 const payload = recv.data;
                 if (payload.len < reliability.NetworkHeader.SIZE) continue;
 
-                const hdr: *const reliability.NetworkHeader = @ptrCast(@alignCast(payload.ptr));
+                // Safe header read: copy into aligned local (H8 fix).
+                var hdr_buf: [@sizeOf(reliability.NetworkHeader)]u8 align(@alignOf(reliability.NetworkHeader)) = undefined;
+                @memcpy(&hdr_buf, payload[0..@sizeOf(reliability.NetworkHeader)]);
+                const hdr: *const reliability.NetworkHeader = @ptrCast(&hdr_buf);
+
+                // NET-3: Validate session/stream ID to reject spoofed packets.
+                if (hdr.session_id != self.config.session_id or hdr.stream_id != self.config.stream_id) continue;
+
+                // NET-5: Validate protocol version.
+                if (hdr.version != 1) continue;
 
                 switch (hdr.header_type) {
                     .data => {
+                        // NET-1 CRITICAL: Validate payload_length against actual packet size.
+                        if (reliability.NetworkHeader.SIZE + hdr.payload_length > payload.len) continue;
+
                         // Track sequence for gap detection
                         _ = self.recv_tracker.recordReceived(hdr.sequence);
 
@@ -149,6 +162,10 @@ pub const NetworkChannel = struct {
     // ── Internal ─────────────────────────────────────────
 
     fn sendWithReliability(self: *NetworkChannel, data: []const u8) !void {
+        // NET-4: Validate combined size fits in packet buffer.
+        const hdr_size = @sizeOf(reliability.NetworkHeader);
+        if (hdr_size + data.len > 65536) return error.MessageTooLarge;
+
         const seq = self.next_sequence;
         self.next_sequence += 1;
 
@@ -175,10 +192,17 @@ pub const NetworkChannel = struct {
     fn handleNak(self: *NetworkChannel, nak_data: []const u8) !void {
         if (nak_data.len < @sizeOf(reliability.NakMessage)) return;
 
-        const nak: *const reliability.NakMessage = @ptrCast(@alignCast(nak_data.ptr));
+        // Safe unaligned read (NET-6 fix).
+        var nak_buf: [@sizeOf(reliability.NakMessage)]u8 align(@alignOf(reliability.NakMessage)) = undefined;
+        @memcpy(&nak_buf, nak_data[0..@sizeOf(reliability.NakMessage)]);
+        const nak: *const reliability.NakMessage = @ptrCast(&nak_buf);
+
+        // NET-2: Cap NAK count to prevent amplification attacks.
+        const max_nak_count: u32 = @intCast(@min(self.config.send_buffer_capacity, 256));
+        const capped_count = @min(nak.count, max_nak_count);
 
         var seq = nak.from_sequence;
-        const end = seq + nak.count;
+        const end = seq + capped_count;
         while (seq < end) : (seq += 1) {
             if (self.send_buf.get(seq)) |entry| {
                 // Retransmit
@@ -239,3 +263,81 @@ pub const NetworkChannel = struct {
         _ = self.udp.send(packet[0 .. hdr_bytes.len + nak_bytes.len], null) catch {};
     }
 };
+
+// ── Tests ────────────────────────────────────────────────────
+const net = std.net;
+
+test "NetworkChannel init and deinit" {
+    const allocator = std.testing.allocator;
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    var ch = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = bind_addr,
+            .non_blocking = true,
+        },
+        .session_id = 1,
+        .stream_id = 1,
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+        .flow_control_window = 1024 * 1024,
+    });
+    defer ch.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), ch.next_sequence);
+    try std.testing.expectEqual(@as(u32, 1), ch.config.session_id);
+    try std.testing.expectEqual(@as(u32, 1), ch.config.stream_id);
+}
+
+test "NetworkChannel publish with flow control" {
+    const allocator = std.testing.allocator;
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    // Discover actual bound port so sendWithReliability has a destination
+    var ch = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = bind_addr,
+            .non_blocking = true,
+            .remote_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 9999),
+        },
+        .session_id = 1,
+        .stream_id = 1,
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+        .flow_control_window = 100,
+    });
+    defer ch.deinit();
+
+    // First publish should succeed (under flow control window)
+    try ch.publish("small", 1);
+    try std.testing.expectEqual(@as(u64, 1), ch.next_sequence);
+
+    // Publish should fail when flow control is exhausted
+    const result = ch.publish(&[_]u8{0xAA} ** 200, 1);
+    try std.testing.expectError(error.BackPressured, result);
+}
+
+test "NetworkChannel publish increments sequence" {
+    const allocator = std.testing.allocator;
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    var ch = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = bind_addr,
+            .non_blocking = true,
+            .remote_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 9999),
+        },
+        .session_id = 1,
+        .stream_id = 1,
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+        .flow_control_window = 4 * 1024 * 1024,
+    });
+    defer ch.deinit();
+
+    try ch.publish("msg1", 1);
+    try ch.publish("msg2", 2);
+    try ch.publish("msg3", 3);
+
+    try std.testing.expectEqual(@as(u64, 3), ch.next_sequence);
+}

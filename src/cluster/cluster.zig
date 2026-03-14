@@ -48,7 +48,7 @@ pub const Cluster = struct {
     }
 
     /// Process an incoming message.
-    pub fn handleMessage(self: *Cluster, from: u32, msg: raft.RaftMessage) ?struct { to: u32, msg: raft.RaftMessage } {
+    pub fn handleMessage(self: *Cluster, from: u32, msg: raft.RaftMessage) ?raft.MessageResponse {
         return self.node.handleMessage(from, msg);
     }
 

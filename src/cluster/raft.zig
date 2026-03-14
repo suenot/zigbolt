@@ -36,7 +36,7 @@ pub const AppendEntries = struct {
     leader_id: u32,
     prev_log_index: u64,
     prev_log_term: u64,
-    entries: []const raft_log.LogEntry,
+    entries: []const raft_log.RaftLog.StoredEntry,
     leader_commit: u64,
 };
 
@@ -44,6 +44,12 @@ pub const AppendEntriesResponse = struct {
     term: u64,
     success: bool,
     match_index: u64,
+};
+
+/// A response to a Raft message: the target node and the message to send.
+pub const MessageResponse = struct {
+    to: u32,
+    msg: RaftMessage,
 };
 
 pub const RaftNode = struct {
@@ -90,7 +96,7 @@ pub const RaftNode = struct {
     }
 
     /// Handle an incoming Raft message from `from`. Returns an optional response.
-    pub fn handleMessage(self: *RaftNode, from: u32, msg: RaftMessage) ?struct { to: u32, msg: RaftMessage } {
+    pub fn handleMessage(self: *RaftNode, from: u32, msg: RaftMessage) ?MessageResponse {
         switch (msg) {
             .request_vote => |rv| return self.handleRequestVote(from, rv),
             .request_vote_response => |rvr| {
@@ -131,29 +137,14 @@ pub const RaftNode = struct {
         else
             0;
 
-        // Convert stored entries to LogEntry slice
-        const stored = self.log.entriesFrom(ni);
-        // We return a slice referencing the stored data. The caller must use it
-        // before the log is modified.
-        const entries: []const raft_log.LogEntry = blk: {
-            if (stored.len == 0) break :blk &.{};
-            // We reinterpret: StoredEntry and LogEntry have the same layout for
-            // term/index, and data is []u8 vs []const u8 which are compatible
-            // for reading. However, to be safe we just build a slice on the stack
-            // — but we can't return stack memory. Instead we return an empty
-            // slice and let the caller use entriesFrom directly.
-            // For simplicity in this implementation, we return empty and the
-            // test/cluster layer handles it via the log directly.
-            break :blk &.{};
-        };
-        _ = entries;
+        const entries = self.log.entriesFrom(ni);
 
         return .{
             .term = self.current_term,
             .leader_id = self.config.node_id,
             .prev_log_index = prev_log_index,
             .prev_log_term = prev_log_term,
-            .entries = &.{},
+            .entries = entries,
             .leader_commit = self.commit_index,
         };
     }
@@ -210,7 +201,7 @@ pub const RaftNode = struct {
         @memset(self.match_index, 0);
     }
 
-    fn updateCommitIndex(self: *RaftNode) void {
+    pub fn updateCommitIndex(self: *RaftNode) void {
         // Find the largest N such that a majority of match_index[i] >= N
         // and log[N].term == currentTerm.
         const last = self.log.lastIndex();
@@ -234,7 +225,7 @@ pub const RaftNode = struct {
         }
     }
 
-    fn handleRequestVote(self: *RaftNode, from: u32, rv: RequestVote) struct { to: u32, msg: RaftMessage } {
+    fn handleRequestVote(self: *RaftNode, from: u32, rv: RequestVote) MessageResponse {
         // If the candidate's term is higher, step down
         if (rv.term > self.current_term) {
             self.becomeFollower(rv.term);
@@ -275,7 +266,7 @@ pub const RaftNode = struct {
         }
     }
 
-    fn handleAppendEntries(self: *RaftNode, from: u32, ae: AppendEntries) struct { to: u32, msg: RaftMessage } {
+    fn handleAppendEntries(self: *RaftNode, from: u32, ae: AppendEntries) MessageResponse {
         if (ae.term > self.current_term) {
             self.becomeFollower(ae.term);
         } else if (ae.term == self.current_term and self.state == .candidate) {
@@ -420,7 +411,6 @@ test "RaftNode: startElection transitions to candidate" {
 }
 
 test "RaftNode: vote granting" {
-    // Node 0 receives a RequestVote from node 1 with higher term
     var node = try RaftNode.init(std.testing.allocator, .{
         .node_id = 0,
         .peer_count = 2,
@@ -454,7 +444,6 @@ test "RaftNode: vote denied when already voted for another" {
     });
     defer node.deinit();
 
-    // Vote for node 1
     _ = node.handleMessage(1, .{ .request_vote = .{
         .term = 1,
         .candidate_id = 1,
@@ -462,7 +451,6 @@ test "RaftNode: vote denied when already voted for another" {
         .last_log_term = 0,
     } });
 
-    // Node 2 requests vote in same term — should be denied
     const result = node.handleMessage(2, .{ .request_vote = .{
         .term = 1,
         .candidate_id = 2,
@@ -486,17 +474,13 @@ test "RaftNode: leader append entries (propose)" {
     });
     defer node.deinit();
 
-    // Become leader: start election then receive enough votes
-    _ = node.startElection(); // term=1, candidate, votes=1
-    // With peer_count=2 (total 3 nodes), need majority = 2 votes.
-    // We already have 1 (self). One more vote makes majority.
+    _ = node.startElection();
     _ = node.handleMessage(1, .{ .request_vote_response = .{
         .term = 1,
         .vote_granted = true,
     } });
     try std.testing.expectEqual(NodeState.leader, node.state);
 
-    // Propose data
     const idx = try node.propose("hello");
     try std.testing.expectEqual(@as(u64, 1), idx);
 
@@ -523,7 +507,6 @@ test "RaftNode: term advancement on higher term message" {
     });
     defer node.deinit();
 
-    // Node is at term 0. Receive AppendEntries with term 5.
     const result = node.handleMessage(1, .{ .append_entries = .{
         .term = 5,
         .leader_id = 1,
@@ -552,10 +535,9 @@ test "RaftNode: candidate steps down on AppendEntries from leader" {
     });
     defer node.deinit();
 
-    _ = node.startElection(); // term=1, candidate
+    _ = node.startElection();
     try std.testing.expectEqual(NodeState.candidate, node.state);
 
-    // Receive AppendEntries from another leader in same term
     _ = node.handleMessage(1, .{ .append_entries = .{
         .term = 1,
         .leader_id = 1,
@@ -575,7 +557,6 @@ test "RaftNode: heartbeat creation" {
     });
     defer node.deinit();
 
-    // Make leader
     _ = node.startElection();
     _ = node.handleMessage(1, .{ .request_vote_response = .{
         .term = 1,
@@ -595,7 +576,6 @@ test "RaftNode: getApplicableEntries and markApplied" {
     });
     defer node.deinit();
 
-    // Make leader and propose
     _ = node.startElection();
     _ = node.handleMessage(1, .{ .request_vote_response = .{
         .term = 1,
@@ -605,17 +585,14 @@ test "RaftNode: getApplicableEntries and markApplied" {
     _ = try node.propose("entry1");
     _ = try node.propose("entry2");
 
-    // Nothing committed yet
     const empty = node.getApplicableEntries();
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
-    // Simulate replication: peer acknowledges up to index 2
     node.match_index[0] = 2;
     node.match_index[1] = 2;
     node.updateCommitIndex();
     try std.testing.expectEqual(@as(u64, 2), node.commit_index);
 
-    // Now we should have applicable entries
     const applicable = node.getApplicableEntries();
     try std.testing.expectEqual(@as(usize, 2), applicable.len);
 

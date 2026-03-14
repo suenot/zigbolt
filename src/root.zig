@@ -23,10 +23,21 @@ pub const LogBuffer = @import("core/log_buffer.zig").LogBuffer;
 pub const LogBufferConfig = @import("core/log_buffer.zig").LogBufferConfig;
 pub const FrameHeader = @import("core/frame.zig").FrameHeader;
 pub const frame = @import("core/frame.zig");
+pub const broadcast = @import("core/broadcast.zig");
+pub const BroadcastTransmitter = broadcast.BroadcastTransmitter;
+pub const BroadcastReceiver = broadcast.BroadcastReceiver;
+pub const CopyBroadcastReceiver = broadcast.CopyBroadcastReceiver;
 pub const counters = @import("core/counters.zig");
 pub const CounterSet = counters.CounterSet;
 pub const CounterType = counters.CounterType;
 pub const GlobalCounters = counters.GlobalCounters;
+pub const idle_strategy = @import("core/idle_strategy.zig");
+pub const IdleStrategy = idle_strategy.IdleStrategy;
+pub const agent = @import("core/agent.zig");
+pub const AgentFn = agent.AgentFn;
+pub const AgentRunner = agent.AgentRunner;
+pub const CompositeAgent = agent.CompositeAgent;
+pub const DutyCycleTracker = agent.DutyCycleTracker;
 
 // ── Wire Codec ───────────────────────────────────────────────
 pub const WireCodec = @import("codec/wire.zig").WireCodec;
@@ -54,6 +65,15 @@ pub const NakMessage = reliability.NakMessage;
 pub const SendBuffer = reliability.SendBuffer;
 pub const RecvTracker = reliability.RecvTracker;
 pub const FlowControl = reliability.FlowControl;
+
+// ── Aeron Flow Control ──────────────────────────────────────
+pub const aeron_flow_control = @import("channel/flow_control.zig");
+pub const AeronFlowControl = aeron_flow_control.FlowControl;
+pub const MinFlowControl = aeron_flow_control.MinFlowControl;
+pub const MaxFlowControl = aeron_flow_control.MaxFlowControl;
+pub const TaggedFlowControl = aeron_flow_control.TaggedFlowControl;
+pub const ReceiverStatus = aeron_flow_control.ReceiverStatus;
+pub const FlowControlConfig = aeron_flow_control.FlowControlConfig;
 
 // ── Congestion Control ─────────────────────────────────────
 pub const congestion = @import("channel/congestion.zig");
@@ -120,6 +140,20 @@ pub const cluster = struct {
     pub const snapshot = @import("cluster/snapshot.zig");
     pub const SnapshotManager = snapshot.SnapshotManager;
     pub const SnapshotData = snapshot.SnapshotData;
+};
+
+// ── Protocol (Aeron-compatible wire flyweights) ──────────────
+pub const protocol = struct {
+    pub const flyweight = @import("protocol/flyweight.zig");
+    pub const HeaderFlyweight = flyweight.HeaderFlyweight;
+    pub const DataHeaderFlyweight = flyweight.DataHeaderFlyweight;
+    pub const StatusMessageFlyweight = flyweight.StatusMessageFlyweight;
+    pub const NakFlyweight = flyweight.NakFlyweight;
+    pub const SetupFlyweight = flyweight.SetupFlyweight;
+    pub const RttMeasurementFlyweight = flyweight.RttMeasurementFlyweight;
+    pub const ErrorFlyweight = flyweight.ErrorFlyweight;
+    pub const FrameType = flyweight.FrameType;
+    pub const ErrorCode = flyweight.ErrorCode;
 };
 
 // ── Re-export key types for convenience ──────────────────────

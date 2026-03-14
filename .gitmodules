@@ -1,0 +1,19 @@
+[submodule "frontend"]
+	path = frontend
+	url = git@github.com:suenot/zigbolt-landing.git
+[submodule "bindings/c"]
+	path = bindings/c
+	url = git@github.com:suenot/zigbolt-c.git
+[submodule "bindings/rust"]
+	path = bindings/rust
+	url = git@github.com:suenot/zigbolt-rust.git
+	branch = main
+[submodule "bindings/python"]
+	path = bindings/python
+	url = git@github.com:suenot/zigbolt-python.git
+[submodule "bindings/go"]
+	path = bindings/go
+	url = git@github.com:suenot/zigbolt-go.git
+[submodule "bindings/ts"]
+	path = bindings/ts
+	url = git@github.com:suenot/zigbolt-ts.git

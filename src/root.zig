@@ -23,11 +23,19 @@ pub const LogBuffer = @import("core/log_buffer.zig").LogBuffer;
 pub const LogBufferConfig = @import("core/log_buffer.zig").LogBufferConfig;
 pub const FrameHeader = @import("core/frame.zig").FrameHeader;
 pub const frame = @import("core/frame.zig");
+pub const counters = @import("core/counters.zig");
+pub const CounterSet = counters.CounterSet;
+pub const CounterType = counters.CounterType;
+pub const GlobalCounters = counters.GlobalCounters;
 
 // ── Wire Codec ───────────────────────────────────────────────
 pub const WireCodec = @import("codec/wire.zig").WireCodec;
 pub const TickMessage = @import("codec/wire.zig").TickMessage;
 pub const OrderMessage = @import("codec/wire.zig").OrderMessage;
+
+// ── SBE Codec ────────────────────────────────────────────────
+pub const sbe = @import("codec/sbe.zig");
+pub const fix = @import("codec/fix_messages.zig");
 
 // ── IPC Channel ──────────────────────────────────────────────
 pub const IpcChannel = @import("channel/ipc.zig").IpcChannel;
@@ -46,6 +54,13 @@ pub const NakMessage = reliability.NakMessage;
 pub const SendBuffer = reliability.SendBuffer;
 pub const RecvTracker = reliability.RecvTracker;
 pub const FlowControl = reliability.FlowControl;
+
+// ── Congestion Control ─────────────────────────────────────
+pub const congestion = @import("channel/congestion.zig");
+pub const CongestionControl = congestion.CongestionControl;
+pub const CongestionConfig = congestion.CongestionConfig;
+pub const RttEstimator = congestion.RttEstimator;
+pub const NakController = congestion.NakController;
 
 // ── Fragment Layer ───────────────────────────────────────────
 pub const fragment = @import("channel/fragment.zig");
@@ -66,10 +81,19 @@ pub const TransportConfig = @import("api/transport.zig").TransportConfig;
 pub const archive = struct {
     pub const segment = @import("archive/segment.zig");
     pub const core = @import("archive/archive.zig");
+    pub const catalog = @import("archive/catalog.zig");
+    pub const index = @import("archive/index.zig");
     pub const Segment = segment.Segment;
     pub const SegmentManager = segment.SegmentManager;
     pub const Archive = core.Archive;
     pub const ArchiveConfig = core.ArchiveConfig;
+    pub const Catalog = catalog.Catalog;
+    pub const CatalogEntry = catalog.CatalogEntry;
+    pub const SparseIndex = index.SparseIndex;
+    pub const IndexEntry = index.IndexEntry;
+    pub const compression = @import("archive/compression.zig");
+    pub const Compressor = compression.Compressor;
+    pub const Decompressor = compression.Decompressor;
 };
 
 // ── Sequencer (Total Ordering) ───────────────────────────────
@@ -90,6 +114,12 @@ pub const cluster = struct {
     pub const Cluster = @import("cluster/cluster.zig").Cluster;
     pub const ClusterConfig = @import("cluster/cluster.zig").ClusterConfig;
     pub const StateMachine = @import("cluster/cluster.zig").StateMachine;
+    pub const WriteAheadLog = @import("cluster/wal.zig").WriteAheadLog;
+    pub const WalEntry = @import("cluster/wal.zig").WalEntry;
+    pub const VoteState = @import("cluster/wal.zig").VoteState;
+    pub const snapshot = @import("cluster/snapshot.zig");
+    pub const SnapshotManager = snapshot.SnapshotManager;
+    pub const SnapshotData = snapshot.SnapshotData;
 };
 
 // ── Re-export key types for convenience ──────────────────────

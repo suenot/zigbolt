@@ -121,7 +121,9 @@ pub const SnapshotManager = struct {
         hasher.update(state_data);
         const crc = hasher.final();
 
-        var dir = try std.fs.cwd().openDir(base, .{});
+        // `.iterate = true` so Linux gives a real fd, not O_PATH — the dir
+        // fsync in syncDir() would otherwise hit unreachable (EBADF).
+        var dir = try std.fs.cwd().openDir(base, .{ .iterate = true });
         defer dir.close();
 
         // On any failure below, remove the temp file so it cannot linger.

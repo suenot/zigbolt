@@ -42,8 +42,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        // shm_open/mlock need libc on Linux (darwin links libSystem implicitly)
+        .link_libc = true,
     });
     const t = b.addTest(.{
+        .name = "root_tests",
         .root_module = test_mod,
     });
     const run_t = b.addRunArtifact(t);
@@ -54,10 +57,21 @@ pub fn build(b: *std.Build) void {
     // cannot be pulled into the root test module via @import. Type-check
     // and run its tests as a dedicated test artifact instead.
     const ffi_tests = b.addTest(.{
+        .name = "ffi_tests",
         .root_module = ffi_mod,
     });
     const run_ffi_tests = b.addRunArtifact(ffi_tests);
     test_step.dependOn(&run_ffi_tests.step);
+
+    // ── Coverage support ─────────────────────────────────────
+    // `zig build install-tests` emits the test binaries WITHOUT running them,
+    // so they can be cross-compiled (e.g. -Dtarget=aarch64-linux-gnu) and run
+    // under kcov in a Linux container for line-coverage measurement.
+    const install_tests_step = b.step("install-tests", "Install test binaries without running them");
+    const ti = b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } });
+    install_tests_step.dependOn(&ti.step);
+    const fti = b.addInstallArtifact(ffi_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } });
+    install_tests_step.dependOn(&fti.step);
 
     // ── Benchmarks ───────────────────────────────────────────
     const bench_step = b.step("bench", "Run benchmarks");

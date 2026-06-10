@@ -156,7 +156,9 @@ pub const SparseIndex = struct {
 
         // Ensure parent directory exists.
         std.fs.cwd().makePath(base_path) catch {};
-        var dir = try std.fs.cwd().openDir(base_path, .{});
+        // `.iterate = true` so Linux gives a real fd, not O_PATH — the dir
+        // fsync in syncDir() would otherwise hit unreachable (EBADF).
+        var dir = try std.fs.cwd().openDir(base_path, .{ .iterate = true });
         defer dir.close();
 
         // On any failure below, remove the temp file so it cannot linger.

@@ -216,8 +216,10 @@ pub const SegmentManager = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, config: SegmentConfig) !SegmentManager {
-        // Create or open the base directory
-        const dir = std.fs.cwd().makeOpenPath(config.base_path, .{}) catch |err| {
+        // Create or open the base directory. `.iterate = true` is required:
+        // without it Linux opens the dir O_PATH and the scan below panics in
+        // the std dir iterator (macOS happens to tolerate it).
+        const dir = std.fs.cwd().makeOpenPath(config.base_path, .{ .iterate = true }) catch |err| {
             std.debug.print("Failed to open archive path '{s}': {}\n", .{ config.base_path, err });
             return err;
         };

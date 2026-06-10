@@ -8,7 +8,9 @@ const builtin = @import("builtin");
 fn syncParentDir(file_path: []const u8) !void {
     if (builtin.os.tag == .windows) return;
     const dir_path = std.fs.path.dirname(file_path) orelse ".";
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    // `.iterate = true` so Linux gives a real fd, not O_PATH — fsync on an
+    // O_PATH fd hits unreachable (EBADF).
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
     defer dir.close();
     try std.posix.fsync(dir.fd);
 }

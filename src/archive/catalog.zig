@@ -259,7 +259,9 @@ pub const Catalog = struct {
 
         // 3. Make the rename itself durable.
         if (std.mem.lastIndexOfScalar(u8, path_slice, '/')) |sep| {
-            var dir = try std.fs.cwd().openDir(path_slice[0..sep], .{});
+            // `.iterate = true` so Linux gives a real fd, not O_PATH — fsync
+            // on an O_PATH fd hits unreachable (EBADF).
+            var dir = try std.fs.cwd().openDir(path_slice[0..sep], .{ .iterate = true });
             defer dir.close();
             try syncDir(dir);
         }

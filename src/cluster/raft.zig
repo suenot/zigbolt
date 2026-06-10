@@ -1,7 +1,40 @@
 const std = @import("std");
 const raft_log = @import("raft_log.zig");
+const wal_mod = @import("wal.zig");
+const snapshot_mod = @import("snapshot.zig");
 
 pub const NodeState = enum { follower, candidate, leader };
+
+/// Durable persistence backend for a RaftNode (optional).
+///
+/// When configured, the node follows a persist-before-reply discipline
+/// (Raft §5): current_term/voted_for are saved via VoteState BEFORE any
+/// response reflecting them is sent, log entries are WAL-appended and
+/// fsync'd BEFORE they are acknowledged (or counted toward a commit quorum
+/// by a leader), and in-memory truncations are mirrored durably on disk.
+///
+/// Ownership/lifetime: the caller owns the WAL, the vote-state path and the
+/// optional SnapshotManager; all three must outlive the RaftNode. The WAL
+/// should be freshly init'd and NOT yet recovered — RaftNode runs
+/// `wal.recover()` itself during `initWithPersistence`. Any WAL SyncPolicy
+/// is safe here because the node always calls `sync()` explicitly before
+/// acknowledging (use `.explicit` to avoid redundant fsyncs).
+///
+/// If a persistence operation ever fails, the node wedges itself
+/// (`persistence_failed = true`): it stops responding to messages, refuses
+/// proposals/elections, and must be restarted (recovery from disk is the
+/// only consistent path). Continuing without durability could acknowledge
+/// state that a crash would silently lose.
+pub const RaftPersistence = struct {
+    /// Write-ahead log mirroring the in-memory Raft log (full log from
+    /// index 1; log compaction is not wired yet).
+    wal: *wal_mod.WriteAheadLog,
+    /// Path of the durable (current_term, voted_for) record.
+    vote_path: []const u8,
+    /// Optional snapshot store: seeds the state-machine base and the
+    /// commit/applied floor at recovery.
+    snapshots: ?*snapshot_mod.SnapshotManager = null,
+};
 
 pub const RaftConfig = struct {
     node_id: u32,
@@ -78,9 +111,39 @@ pub const RaftNode = struct {
     // Number of votes won in the current election (self + granted set bits).
     votes_received: u32,
 
+    /// Optional durable backend. When null, the node is purely in-memory
+    /// (exactly the pre-persistence behavior; used by the test harness).
+    persistence: ?RaftPersistence,
+    /// Sticky wedge flag: set on ANY persistence failure. A wedged node
+    /// drops all messages and refuses proposals/elections — in-memory state
+    /// may be ahead of disk at that point, and replying could acknowledge
+    /// state a crash would lose. The embedder should treat this as fatal
+    /// and restart the node (recovery from disk is consistent).
+    persistence_failed: bool,
+    /// Application state recovered from the latest snapshot at startup
+    /// (null if none). Take it with `takeRecoveredSnapshot()` to seed the
+    /// state machine; freed in deinit() if never taken.
+    recovered_snapshot: ?snapshot_mod.SnapshotData,
+
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, config: RaftConfig) !RaftNode {
+        return initWithPersistence(allocator, config, null);
+    }
+
+    /// Init with an optional durable backend. With persistence configured,
+    /// recovery runs before the node is usable, in this order:
+    ///   1. VoteState.load(): restore current_term/voted_for. A missing file
+    ///      means "never voted"; a corrupt one is FATAL (error.CorruptVoteState)
+    ///      — starting fresh could double-vote in an already-voted term.
+    ///   2. Latest valid snapshot (if a SnapshotManager is configured): seeds
+    ///      the state-machine base and the commit/applied floor.
+    ///   3. wal.recover(): durably truncates any corrupt tail, then the
+    ///      surviving entries are replayed into the in-memory log.
+    /// commit_index/last_applied restart at the snapshot's lastIncludedIndex
+    /// (0 without one); entries after that point re-commit and re-apply
+    /// through the normal protocol, per Raft.
+    pub fn initWithPersistence(allocator: std.mem.Allocator, config: RaftConfig, persistence: ?RaftPersistence) !RaftNode {
         const next_idx = try allocator.alloc(u64, config.peer_count);
         errdefer allocator.free(next_idx);
         @memset(next_idx, 1);
@@ -107,7 +170,7 @@ pub const RaftNode = struct {
         errdefer allocator.free(votes);
         @memset(votes, false);
 
-        return .{
+        var node: RaftNode = .{
             .config = config,
             .state = .follower,
             .current_term = 0,
@@ -120,11 +183,24 @@ pub const RaftNode = struct {
             .match_index = match_idx,
             .votes_granted = votes,
             .votes_received = 0,
+            .persistence = persistence,
+            .persistence_failed = false,
+            .recovered_snapshot = null,
             .allocator = allocator,
         };
+
+        if (persistence != null) {
+            errdefer node.log.deinit();
+            errdefer if (node.recovered_snapshot) |*s| s.deinit();
+            try node.recoverFromDisk();
+        }
+
+        return node;
     }
 
     pub fn deinit(self: *RaftNode) void {
+        if (self.recovered_snapshot) |*s| s.deinit();
+        self.recovered_snapshot = null;
         self.allocator.free(self.peers);
         self.allocator.free(self.next_index);
         self.allocator.free(self.match_index);
@@ -132,8 +208,94 @@ pub const RaftNode = struct {
         self.log.deinit();
     }
 
+    /// Reconstruct durable state from disk (see initWithPersistence docs).
+    fn recoverFromDisk(self: *RaftNode) !void {
+        const p = self.persistence.?;
+
+        // 1. Vote state. null = file absent = genuinely never voted.
+        //    error.CorruptVoteState propagates: refusing to start is the only
+        //    safe response — a node that forgot a granted vote can vote twice
+        //    in the same term and elect two leaders.
+        if (try wal_mod.VoteState.load(p.vote_path)) |vs| {
+            self.current_term = vs.current_term;
+            self.voted_for = vs.voted_for;
+        }
+
+        // 2. Snapshot base (optional). The snapshot only ever contains
+        //    committed-and-applied state, so its lastIncludedIndex is a safe
+        //    floor for commit_index/last_applied. "All snapshots corrupt"
+        //    propagates as an error rather than silently starting empty.
+        var snap_index: u64 = 0;
+        if (p.snapshots) |mgr| {
+            if (try mgr.loadLatestSnapshot()) |snap| {
+                self.recovered_snapshot = snap;
+                snap_index = snap.last_included_index;
+            }
+        }
+
+        // 3. WAL replay. recover() durably truncates any corrupt tail; the
+        //    surviving prefix is exactly what this node ever acknowledged.
+        //    The WAL holds the full log from index 1 (no compaction), so the
+        //    in-memory indices line up by construction — verify anyway.
+        const entries = try p.wal.recover();
+        defer {
+            for (entries) |e| self.allocator.free(e.data);
+            self.allocator.free(entries);
+        }
+        for (entries) |e| {
+            const idx = try self.log.append(e.term, e.data);
+            if (idx != e.index) return error.WalLogMismatch;
+        }
+
+        // 4. Volatile indices per Raft: commit floor = snapshot point;
+        //    everything after it re-commits and re-applies via the protocol.
+        self.commit_index = snap_index;
+        self.last_applied = snap_index;
+    }
+
+    /// Take ownership of the application state recovered from the latest
+    /// snapshot at startup (null if there was none). The caller must
+    /// `deinit()` the returned SnapshotData after restoring it into the
+    /// state machine.
+    pub fn takeRecoveredSnapshot(self: *RaftNode) ?snapshot_mod.SnapshotData {
+        const snap = self.recovered_snapshot;
+        self.recovered_snapshot = null;
+        return snap;
+    }
+
+    /// Persist a snapshot of the application state machine, which must
+    /// reflect EXACTLY the entries up to `last_applied` (snapshotting state
+    /// that includes uncommitted entries would make phantom writes durable).
+    /// Atomic on disk; a failure here leaves the previous snapshot intact
+    /// and does NOT wedge the node (the WAL still has the full log).
+    pub fn takeSnapshot(self: *RaftNode, state_data: []const u8) !void {
+        if (self.persistence_failed) return error.PersistenceFailed;
+        const p = self.persistence orelse return error.NoPersistence;
+        const mgr = p.snapshots orelse return error.NoSnapshotManager;
+        if (self.last_applied == 0) return error.NothingToSnapshot;
+        const entry = self.log.getEntry(self.last_applied) orelse return error.SnapshotPointMissing;
+        try mgr.takeSnapshot(entry.term, self.last_applied, state_data);
+    }
+
+    /// Durably record (term, voted_for) BEFORE the change becomes visible in
+    /// memory or in any reply (persist-before-reply, Raft §5). No-op without
+    /// persistence. On failure the node wedges itself and the caller MUST
+    /// drop the triggering message instead of replying.
+    fn persistVote(self: *RaftNode, term: u64, voted_for: ?u32) !void {
+        const p = self.persistence orelse return;
+        const vs = wal_mod.VoteState{ .current_term = term, .voted_for = voted_for };
+        vs.save(p.vote_path) catch |err| {
+            self.persistence_failed = true;
+            return err;
+        };
+    }
+
     /// Handle an incoming Raft message from `from`. Returns an optional response.
+    /// With persistence configured, a null where a response was expected means
+    /// the message was DROPPED because durability could not be guaranteed
+    /// (node wedged); dropping is always safe — it is equivalent to packet loss.
     pub fn handleMessage(self: *RaftNode, from: u32, msg: RaftMessage) ?MessageResponse {
+        if (self.persistence_failed) return null;
         switch (msg) {
             .request_vote => |rv| return self.handleRequestVote(from, rv),
             .request_vote_response => |rvr| {
@@ -148,8 +310,15 @@ pub const RaftNode = struct {
         }
     }
 
-    /// Called on election timeout. Transitions to candidate and returns a RequestVote message.
-    pub fn startElection(self: *RaftNode) RaftMessage {
+    /// Called on election timeout. Transitions to candidate and returns a
+    /// RequestVote message, or null if the new term's self-vote could not be
+    /// made durable (the election must NOT proceed in that case — campaigning
+    /// on a vote that a crash would forget can elect two leaders).
+    pub fn startElection(self: *RaftNode) ?RaftMessage {
+        if (self.persistence_failed) return null;
+        // Persist (term+1, vote-for-self) BEFORE acting as a candidate or
+        // letting the RequestVote out (persist-before-reply).
+        self.persistVote(self.current_term + 1, self.config.node_id) catch return null;
         self.becomeCandidate();
         // A single-node cluster (peer_count == 0, quorum of 1) wins the
         // election with just its own vote; no responses will ever arrive.
@@ -165,9 +334,23 @@ pub const RaftNode = struct {
     }
 
     /// Leader: propose a new log entry. Returns the log index.
+    /// With persistence, the entry is WAL-appended and fsync'd BEFORE the
+    /// leader counts itself toward the commit quorum: a leader whose own
+    /// "replica" of an entry is only in RAM must not contribute to majority.
     pub fn propose(self: *RaftNode, data: []const u8) !u64 {
+        if (self.persistence_failed) return error.PersistenceFailed;
         if (self.state != .leader) return error.NotLeader;
         const index = try self.log.append(self.current_term, data);
+        if (self.persistence) |p| {
+            p.wal.append(self.current_term, index, data) catch |err| {
+                self.persistence_failed = true;
+                return err;
+            };
+            p.wal.sync() catch |err| {
+                self.persistence_failed = true;
+                return err;
+            };
+        }
         // In a single-node cluster (quorum of 1) the entry commits at once;
         // with peers this recomputes from unchanged match_index (a no-op).
         self.updateCommitIndex();
@@ -175,8 +358,10 @@ pub const RaftNode = struct {
     }
 
     /// Leader: create an AppendEntries message for a specific peer.
-    /// Returns null if `peer_id` is not a known peer (e.g. our own id).
+    /// Returns null if `peer_id` is not a known peer (e.g. our own id), or if
+    /// the node is wedged (entries past the durable prefix must not be sent).
     pub fn createAppendEntries(self: *RaftNode, peer_id: u32) ?AppendEntries {
+        if (self.persistence_failed) return null;
         const slot = self.peerSlot(peer_id) orelse return null;
         return self.buildAppendEntries(slot, true);
     }
@@ -184,8 +369,9 @@ pub const RaftNode = struct {
     /// Leader: create a heartbeat for a specific peer. A heartbeat is just an
     /// AppendEntries with no entries, built from that peer's next_index so a
     /// lagging follower still passes (or meaningfully fails) the consistency
-    /// check. Returns null if `peer_id` is not a known peer.
+    /// check. Returns null if `peer_id` is not a known peer or the node is wedged.
     pub fn createHeartbeat(self: *RaftNode, peer_id: u32) ?AppendEntries {
+        if (self.persistence_failed) return null;
         const slot = self.peerSlot(peer_id) orelse return null;
         return self.buildAppendEntries(slot, false);
     }
@@ -250,10 +436,18 @@ pub const RaftNode = struct {
         return count * 2 > self.config.peer_count + 1;
     }
 
+    /// Callers that pass a HIGHER term must persist (term, null) via
+    /// persistVote() BEFORE calling this (persist-before-reply).
     fn becomeFollower(self: *RaftNode, term: u64) void {
         self.state = .follower;
-        self.current_term = term;
-        self.voted_for = null;
+        // voted_for is only reset when the term actually advances: it is
+        // persistent WITHIN a term (Raft §5.2). A same-term step-down (e.g.
+        // a candidate seeing an established leader) must keep it — clearing
+        // it would let this node grant a second vote in the same term.
+        if (term > self.current_term) {
+            self.current_term = term;
+            self.voted_for = null;
+        }
         self.votes_received = 0;
         @memset(self.votes_granted, false);
     }
@@ -300,22 +494,37 @@ pub const RaftNode = struct {
         }
     }
 
-    fn handleRequestVote(self: *RaftNode, from: u32, rv: RequestVote) MessageResponse {
-        // If the candidate's term is higher, step down
-        if (rv.term > self.current_term) {
-            self.becomeFollower(rv.term);
-        }
+    fn handleRequestVote(self: *RaftNode, from: u32, rv: RequestVote) ?MessageResponse {
+        // Decide first, persist, and only then commit to memory and reply:
+        // a granted vote (or a term bump carried in the reply) that is not
+        // durable yet can be forgotten by a crash, and a restarted node that
+        // forgot a vote can vote again in the same term — two leaders.
+        const stepping_down = rv.term > self.current_term;
+        const new_term = if (stepping_down) rv.term else self.current_term;
+        // voted_for as it would be after the (potential) term bump.
+        var new_voted_for: ?u32 = if (stepping_down) null else self.voted_for;
 
         var granted = false;
         if (rv.term >= self.current_term) {
-            const can_vote = (self.voted_for == null or self.voted_for.? == rv.candidate_id);
+            const can_vote = (new_voted_for == null or new_voted_for.? == rv.candidate_id);
             const log_ok = (rv.last_log_term > self.log.lastTerm()) or
                 (rv.last_log_term == self.log.lastTerm() and rv.last_log_index >= self.log.lastIndex());
             if (can_vote and log_ok) {
-                self.voted_for = rv.candidate_id;
+                new_voted_for = rv.candidate_id;
                 granted = true;
             }
         }
+
+        // Persist-before-reply: durable BEFORE any in-memory change or
+        // response. On failure, drop the message (the node is wedged).
+        if (new_term != self.current_term or !std.meta.eql(new_voted_for, self.voted_for)) {
+            self.persistVote(new_term, new_voted_for) catch return null;
+        }
+
+        if (stepping_down) {
+            self.becomeFollower(rv.term);
+        }
+        self.voted_for = new_voted_for;
 
         return .{
             .to = from,
@@ -328,6 +537,10 @@ pub const RaftNode = struct {
 
     fn handleRequestVoteResponse(self: *RaftNode, from: u32, rvr: RequestVoteResponse) void {
         if (rvr.term > self.current_term) {
+            // No reply is sent here, but the bumped term WILL be carried by
+            // future messages: persist it before it becomes visible. On
+            // failure, drop (equivalent to having never seen the response).
+            self.persistVote(rvr.term, null) catch return;
             self.becomeFollower(rvr.term);
             return;
         }
@@ -362,11 +575,15 @@ pub const RaftNode = struct {
         };
     }
 
-    fn handleAppendEntries(self: *RaftNode, from: u32, ae: AppendEntries) MessageResponse {
+    fn handleAppendEntries(self: *RaftNode, from: u32, ae: AppendEntries) ?MessageResponse {
         if (ae.term > self.current_term) {
+            // The response below carries the bumped term: persist it BEFORE
+            // it becomes visible anywhere. On failure, drop the message.
+            self.persistVote(ae.term, null) catch return null;
             self.becomeFollower(ae.term);
         } else if (ae.term == self.current_term and self.state == .candidate) {
-            // Another leader exists for this term; step down
+            // Another leader exists for this term; step down. Same-term:
+            // current_term/voted_for are unchanged (and stay persisted).
             self.becomeFollower(ae.term);
         }
 
@@ -396,7 +613,13 @@ pub const RaftNode = struct {
             }
         }
 
-        // Append new entries (handle conflicts)
+        // Append new entries (handle conflicts). Every in-memory log change
+        // is mirrored to the WAL; new entries are fsync'd in one batch below
+        // BEFORE the success reply (persist-before-reply). On any WAL
+        // failure the node wedges and the message is dropped unanswered —
+        // memory may then be ahead of disk, but nothing un-durable was ever
+        // acknowledged, and a restart recovers the consistent disk state.
+        var wal_dirty = false;
         for (ae.entries) |entry| {
             const existing = self.log.getEntry(entry.index);
             if (existing) |ex| {
@@ -407,17 +630,50 @@ pub const RaftNode = struct {
                     if (entry.index <= self.commit_index) {
                         return self.appendFailure(from, 0);
                     }
+                    // Durable on-disk truncation FIRST: if the in-memory
+                    // truncation ran alone, a restart would resurrect the
+                    // conflicting tail from the WAL.
+                    if (self.persistence) |p| {
+                        p.wal.truncateFrom(entry.index) catch {
+                            self.persistence_failed = true;
+                            return null;
+                        };
+                    }
                     self.log.truncateFrom(entry.index);
-                    _ = self.log.append(entry.term, entry.data) catch {
+                    const idx = self.log.append(entry.term, entry.data) catch {
                         return self.appendFailure(from, self.log.lastIndex());
                     };
+                    if (self.persistence) |p| {
+                        p.wal.append(entry.term, idx, entry.data) catch {
+                            self.persistence_failed = true;
+                            return null;
+                        };
+                        wal_dirty = true;
+                    }
                 }
-                // If terms match, entry is already present; skip
+                // If terms match, entry is already present (and already
+                // durable from when it was first acknowledged); skip.
             } else {
-                _ = self.log.append(entry.term, entry.data) catch {
+                const idx = self.log.append(entry.term, entry.data) catch {
                     return self.appendFailure(from, self.log.lastIndex());
                 };
+                if (self.persistence) |p| {
+                    p.wal.append(entry.term, idx, entry.data) catch {
+                        self.persistence_failed = true;
+                        return null;
+                    };
+                    wal_dirty = true;
+                }
             }
+        }
+
+        // Log durability before ack: fsync everything appended above before
+        // the success response leaves this node.
+        if (wal_dirty) {
+            self.persistence.?.wal.sync() catch {
+                self.persistence_failed = true;
+                return null;
+            };
         }
 
         // Index of the last entry this RPC actually vouches for. Our own log
@@ -446,6 +702,8 @@ pub const RaftNode = struct {
 
     fn handleAppendEntriesResponse(self: *RaftNode, from: u32, aer: AppendEntriesResponse) void {
         if (aer.term > self.current_term) {
+            // Persist the term bump before it can leak into future messages.
+            self.persistVote(aer.term, null) catch return;
             self.becomeFollower(aer.term);
             return;
         }
@@ -506,7 +764,7 @@ test "RaftNode: startElection transitions to candidate" {
     });
     defer node.deinit();
 
-    const msg = node.startElection();
+    const msg = node.startElection().?;
     try std.testing.expectEqual(NodeState.candidate, node.state);
     try std.testing.expectEqual(@as(u64, 1), node.current_term);
     try std.testing.expectEqual(@as(?u32, 1), node.voted_for);
@@ -738,7 +996,7 @@ fn testExchange(nodes: []RaftNode, from: u32, to: u32, msg: RaftMessage) void {
 }
 
 fn testElect(nodes: []RaftNode, candidate: u32) void {
-    const rv = nodes[candidate].startElection();
+    const rv = nodes[candidate].startElection().?;
     for (nodes, 0..) |_, i| {
         const id: u32 = @intCast(i);
         if (id == candidate) continue;
@@ -1202,4 +1460,451 @@ test "RaftNode: follower never commits a stale tail beyond entries covered by th
         else => return error.UnexpectedMessage,
     }
     try std.testing.expectEqual(@as(u64, 1), node.commit_index);
+}
+
+// =============================================================================
+// Persistence / restart tests.
+// Each "boot" opens a fresh WriteAheadLog handle and RaftNode over the SAME
+// on-disk directory; deinit + re-init simulates a process restart: every
+// piece of in-memory Raft state is rebuilt strictly through the recovery
+// path (VoteState.load -> snapshot -> wal.recover + replay).
+// =============================================================================
+
+/// Stable storage for the per-test on-disk paths (the slices point into the
+/// embedded buffers, so the struct must not be copied after init).
+const TestPaths = struct {
+    dir_buf: [std.fs.max_path_bytes]u8 = undefined,
+    wal_buf: [std.fs.max_path_bytes]u8 = undefined,
+    vote_buf: [std.fs.max_path_bytes]u8 = undefined,
+    dir: []const u8 = &.{},
+    wal_path: []const u8 = &.{},
+    vote_path: []const u8 = &.{},
+
+    fn init(self: *TestPaths, d: std.fs.Dir, node_id: u32) !void {
+        self.dir = try d.realpath(".", &self.dir_buf);
+        self.wal_path = try std.fmt.bufPrint(&self.wal_buf, "{s}/raft{d}.wal", .{ self.dir, node_id });
+        self.vote_path = try std.fmt.bufPrint(&self.vote_buf, "{s}/vote{d}.state", .{ self.dir, node_id });
+    }
+};
+
+test "RaftNode: persistence — granted vote survives restart, no double vote in same term" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths: TestPaths = .{};
+    try paths.init(tmp.dir, 0);
+
+    // Boot 1: grant our vote to candidate 1 in term 5.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 2,
+        }, .{ .wal = &wal, .vote_path = paths.vote_path });
+        defer node.deinit();
+
+        const resp = node.handleMessage(1, .{ .request_vote = .{
+            .term = 5,
+            .candidate_id = 1,
+            .last_log_index = 0,
+            .last_log_term = 0,
+        } });
+        switch (resp.?.msg) {
+            .request_vote_response => |rvr| {
+                try std.testing.expect(rvr.vote_granted);
+                try std.testing.expectEqual(@as(u64, 5), rvr.term);
+            },
+            else => return error.UnexpectedMessage,
+        }
+    }
+
+    // Boot 2 (restart from the same directory): the vote MUST be remembered.
+    // Forgetting it and granting candidate 2 in the same term would give
+    // term 5 two leaders — the classic restart split-brain.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 2,
+        }, .{ .wal = &wal, .vote_path = paths.vote_path });
+        defer node.deinit();
+
+        try std.testing.expectEqual(@as(u64, 5), node.current_term);
+        try std.testing.expectEqual(@as(?u32, 1), node.voted_for);
+
+        // A DIFFERENT candidate in the SAME term is refused...
+        const rival = node.handleMessage(2, .{ .request_vote = .{
+            .term = 5,
+            .candidate_id = 2,
+            .last_log_index = 0,
+            .last_log_term = 0,
+        } });
+        switch (rival.?.msg) {
+            .request_vote_response => |rvr| {
+                try std.testing.expect(!rvr.vote_granted);
+                try std.testing.expectEqual(@as(u64, 5), rvr.term);
+            },
+            else => return error.UnexpectedMessage,
+        }
+
+        // ...while a retransmission from the ORIGINAL candidate is still
+        // granted (idempotent, no new persistence needed).
+        const again = node.handleMessage(1, .{ .request_vote = .{
+            .term = 5,
+            .candidate_id = 1,
+            .last_log_index = 0,
+            .last_log_term = 0,
+        } });
+        switch (again.?.msg) {
+            .request_vote_response => |rvr| try std.testing.expect(rvr.vote_granted),
+            else => return error.UnexpectedMessage,
+        }
+    }
+}
+
+test "RaftNode: persistence — leader log and term survive restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths: TestPaths = .{};
+    try paths.init(tmp.dir, 0);
+
+    // Boot 1: single-node leader proposes two entries. propose() persists
+    // each entry (append + fsync) BEFORE counting itself in the quorum, so
+    // by the time commit_index moved, the entries were already durable.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 0,
+        }, .{ .wal = &wal, .vote_path = paths.vote_path });
+        defer node.deinit();
+
+        _ = node.startElection().?; // term 1, persists self-vote
+        try std.testing.expectEqual(NodeState.leader, node.state);
+        _ = try node.propose("alpha");
+        _ = try node.propose("beta");
+        try std.testing.expectEqual(@as(u64, 2), node.commit_index);
+        // The WAL holds both entries durably.
+        try std.testing.expectEqual(@as(u64, 2), wal.lastIndex());
+    }
+
+    // Boot 2: everything durable is recovered; volatile commit state restarts
+    // at 0 (no snapshot) and is re-derived by the protocol.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 0,
+        }, .{ .wal = &wal, .vote_path = paths.vote_path });
+        defer node.deinit();
+
+        try std.testing.expectEqual(@as(u64, 1), node.current_term);
+        try std.testing.expectEqual(@as(?u32, 0), node.voted_for);
+        try std.testing.expectEqual(NodeState.follower, node.state);
+        try std.testing.expectEqual(@as(u64, 2), node.log.lastIndex());
+        try std.testing.expectEqualStrings("alpha", node.log.getEntry(1).?.data);
+        try std.testing.expectEqualStrings("beta", node.log.getEntry(2).?.data);
+        try std.testing.expectEqual(@as(u64, 0), node.commit_index);
+        try std.testing.expectEqual(@as(u64, 0), node.last_applied);
+
+        // Re-elect and commit a current-term entry: the recovered entries
+        // commit transitively (Raft Figure 8 discipline still holds).
+        _ = node.startElection().?; // term 2
+        try std.testing.expectEqual(NodeState.leader, node.state);
+        _ = try node.propose("gamma");
+        try std.testing.expectEqual(@as(u64, 3), node.commit_index);
+        try std.testing.expectEqual(@as(usize, 3), node.getApplicableEntries().len);
+    }
+}
+
+test "RaftNode: persistence — three-node cluster, restarted follower recovers replicated log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var paths: [3]TestPaths = .{ .{}, .{}, .{} };
+    for (&paths, 0..) |*p, i| try p.init(tmp.dir, @intCast(i));
+
+    var wals: [3]wal_mod.WriteAheadLog = undefined;
+    var nodes: [3]RaftNode = undefined;
+    var booted: usize = 0;
+    defer for (wals[0..booted]) |*w| w.deinit();
+    defer for (nodes[0..booted]) |*n| n.deinit();
+    for (0..3) |i| {
+        wals[i] = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths[i].wal_path,
+            .sync_policy = .explicit,
+        });
+        errdefer wals[i].deinit();
+        nodes[i] = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = @intCast(i),
+            .peer_count = 2,
+        }, .{ .wal = &wals[i], .vote_path = paths[i].vote_path });
+        booted += 1;
+    }
+
+    // Term 1: node 0 leads, replicates 3 entries to everyone, commit = 3.
+    testElect(&nodes, 0);
+    try std.testing.expectEqual(NodeState.leader, nodes[0].state);
+    _ = try nodes[0].propose("a");
+    _ = try nodes[0].propose("b");
+    _ = try nodes[0].propose("c");
+    testReplicate(&nodes, 0, 1);
+    testReplicate(&nodes, 0, 2);
+    testHeartbeat(&nodes, 0, 1); // propagate commit index to node 1
+    try std.testing.expectEqual(@as(u64, 3), nodes[0].commit_index);
+    try std.testing.expectEqual(@as(u64, 3), nodes[1].commit_index);
+
+    // Restart node 1 from disk: the acknowledged log and the granted vote
+    // come back; volatile commit state restarts at 0.
+    nodes[1].deinit();
+    wals[1].deinit();
+    wals[1] = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+        .path = paths[1].wal_path,
+        .sync_policy = .explicit,
+    });
+    nodes[1] = try RaftNode.initWithPersistence(std.testing.allocator, .{
+        .node_id = 1,
+        .peer_count = 2,
+    }, .{ .wal = &wals[1], .vote_path = paths[1].vote_path });
+
+    try std.testing.expectEqual(@as(u64, 1), nodes[1].current_term);
+    try std.testing.expectEqual(@as(?u32, 0), nodes[1].voted_for); // vote for node 0 remembered
+    try std.testing.expectEqual(@as(u64, 3), nodes[1].log.lastIndex());
+    try std.testing.expectEqualStrings("b", nodes[1].log.getEntry(2).?.data);
+    try std.testing.expectEqual(@as(u64, 0), nodes[1].commit_index);
+
+    // The next leader heartbeat passes the consistency check against the
+    // recovered log and re-teaches the follower its commit index.
+    testHeartbeat(&nodes, 0, 1);
+    try std.testing.expectEqual(@as(u64, 3), nodes[1].commit_index);
+}
+
+test "RaftNode: persistence — conflict truncation is durable across restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths: TestPaths = .{};
+    try paths.init(tmp.dir, 0);
+
+    var data_a = "a".*;
+    var data_b = "b".*;
+    var data_x = "x".*;
+    var data_y = "y".*;
+
+    // Boot 1: follower accepts an (uncommitted) tail from the term-1 leader,
+    // then a term-2 leader overwrites the divergent entry at index 3.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 2,
+        }, .{ .wal = &wal, .vote_path = paths.vote_path });
+        defer node.deinit();
+
+        const e1 = raft_log.RaftLog.StoredEntry{ .term = 1, .index = 1, .data = &data_a };
+        const e2 = raft_log.RaftLog.StoredEntry{ .term = 1, .index = 2, .data = &data_b };
+        const e3_old = raft_log.RaftLog.StoredEntry{ .term = 1, .index = 3, .data = &data_x };
+        const ok = node.handleMessage(1, .{ .append_entries = .{
+            .term = 1,
+            .leader_id = 1,
+            .prev_log_index = 0,
+            .prev_log_term = 0,
+            .entries = &.{ e1, e2, e3_old },
+            .leader_commit = 0,
+        } });
+        switch (ok.?.msg) {
+            .append_entries_response => |aer| try std.testing.expect(aer.success),
+            else => return error.UnexpectedMessage,
+        }
+
+        // New leader (term 2) replaces the uncommitted entry 3: the on-disk
+        // log is truncated durably BEFORE the replacement is appended.
+        const e3_new = raft_log.RaftLog.StoredEntry{ .term = 2, .index = 3, .data = &data_y };
+        const resp = node.handleMessage(2, .{ .append_entries = .{
+            .term = 2,
+            .leader_id = 2,
+            .prev_log_index = 2,
+            .prev_log_term = 1,
+            .entries = &.{e3_new},
+            .leader_commit = 0,
+        } });
+        switch (resp.?.msg) {
+            .append_entries_response => |aer| try std.testing.expect(aer.success),
+            else => return error.UnexpectedMessage,
+        }
+        try std.testing.expectEqual(@as(u64, 2), node.log.getEntry(3).?.term);
+    }
+
+    // Boot 2: the truncated term-1 entry must NOT resurrect from disk —
+    // if it did, this node could ack the same index with two different
+    // values across its lifetimes.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 2,
+        }, .{ .wal = &wal, .vote_path = paths.vote_path });
+        defer node.deinit();
+
+        try std.testing.expectEqual(@as(u64, 2), node.current_term);
+        try std.testing.expectEqual(@as(u64, 3), node.log.lastIndex());
+        const e3 = node.log.getEntry(3).?;
+        try std.testing.expectEqual(@as(u64, 2), e3.term);
+        try std.testing.expectEqualStrings("y", e3.data);
+    }
+}
+
+test "RaftNode: persistence — corrupt vote file refuses to start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths: TestPaths = .{};
+    try paths.init(tmp.dir, 0);
+
+    // Boot 1: grant a vote so the vote file exists.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 2,
+        }, .{ .wal = &wal, .vote_path = paths.vote_path });
+        defer node.deinit();
+        _ = node.handleMessage(1, .{ .request_vote = .{
+            .term = 3,
+            .candidate_id = 1,
+            .last_log_index = 0,
+            .last_log_term = 0,
+        } });
+    }
+
+    // Corrupt the vote record on disk (bit flip).
+    {
+        const f = try tmp.dir.openFile("vote0.state", .{ .mode = .read_write });
+        defer f.close();
+        var byte: [1]u8 = undefined;
+        _ = try f.preadAll(&byte, 3);
+        byte[0] ^= 0xFF;
+        try f.seekTo(3);
+        try f.writeAll(&byte);
+    }
+
+    // Boot 2 MUST refuse to start. Silently starting "fresh" would forget
+    // the term-3 vote and allow a second one in the same term.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        try std.testing.expectError(error.CorruptVoteState, RaftNode.initWithPersistence(
+            std.testing.allocator,
+            .{ .node_id = 0, .peer_count = 2 },
+            .{ .wal = &wal, .vote_path = paths.vote_path },
+        ));
+    }
+}
+
+test "RaftNode: persistence — snapshot seeds commit/applied floor and tail replays" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths: TestPaths = .{};
+    try paths.init(tmp.dir, 0);
+
+    // Boot 1: single-node leader applies 3 entries, snapshots the state
+    // machine at last_applied = 3, then appends 2 more committed entries.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var snaps = try snapshot_mod.SnapshotManager.init(std.testing.allocator, .{
+            .base_path = paths.dir,
+        });
+        defer snaps.deinit();
+        var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 0,
+        }, .{ .wal = &wal, .vote_path = paths.vote_path, .snapshots = &snaps });
+        defer node.deinit();
+
+        _ = node.startElection().?; // term 1
+        _ = try node.propose("a");
+        _ = try node.propose("b");
+        _ = try node.propose("c");
+        node.markApplied(3);
+        try node.takeSnapshot("state-at-3");
+
+        _ = try node.propose("d");
+        _ = try node.propose("e");
+        try std.testing.expectEqual(@as(u64, 5), node.commit_index);
+    }
+
+    // Boot 2: the snapshot seeds the state-machine base and the
+    // commit/applied floor; the WAL tail past it is replayed and re-commits
+    // through the protocol — the snapshotted prefix is never re-applied.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = paths.wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var snaps = try snapshot_mod.SnapshotManager.init(std.testing.allocator, .{
+            .base_path = paths.dir,
+        });
+        defer snaps.deinit();
+        var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 0,
+        }, .{ .wal = &wal, .vote_path = paths.vote_path, .snapshots = &snaps });
+        defer node.deinit();
+
+        var snap = node.takeRecoveredSnapshot().?;
+        defer snap.deinit();
+        try std.testing.expectEqual(@as(u64, 3), snap.last_included_index);
+        try std.testing.expectEqual(@as(u64, 1), snap.last_included_term);
+        try std.testing.expectEqualStrings("state-at-3", snap.data);
+
+        try std.testing.expectEqual(@as(u64, 3), node.commit_index);
+        try std.testing.expectEqual(@as(u64, 3), node.last_applied);
+        try std.testing.expectEqual(@as(u64, 5), node.log.lastIndex());
+        // Nothing is applicable yet: the prefix is inside the snapshot and
+        // the tail is not (re-)committed yet.
+        try std.testing.expectEqual(@as(usize, 0), node.getApplicableEntries().len);
+
+        // Re-elect; committing a current-term entry re-commits the tail.
+        _ = node.startElection().?; // term 2
+        _ = try node.propose("f");
+        try std.testing.expectEqual(@as(u64, 6), node.commit_index);
+        const applicable = node.getApplicableEntries();
+        try std.testing.expectEqual(@as(usize, 3), applicable.len);
+        try std.testing.expectEqual(@as(u64, 4), applicable[0].index);
+        try std.testing.expectEqualStrings("d", applicable[0].data);
+        try std.testing.expectEqualStrings("f", applicable[2].data);
+    }
 }

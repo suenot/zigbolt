@@ -129,6 +129,7 @@ pub const cluster = struct {
     pub const LogEntry = @import("cluster/raft_log.zig").LogEntry;
     pub const RaftNode = @import("cluster/raft.zig").RaftNode;
     pub const RaftConfig = @import("cluster/raft.zig").RaftConfig;
+    pub const RaftPersistence = @import("cluster/raft.zig").RaftPersistence;
     pub const RaftMessage = @import("cluster/raft.zig").RaftMessage;
     pub const NodeState = @import("cluster/raft.zig").NodeState;
     pub const Cluster = @import("cluster/cluster.zig").Cluster;

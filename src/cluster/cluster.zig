@@ -1,6 +1,8 @@
 const std = @import("std");
 const raft = @import("raft.zig");
 const raft_log = @import("raft_log.zig");
+const wal_mod = @import("wal.zig");
+const snapshot_mod = @import("snapshot.zig");
 
 pub const ClusterConfig = struct {
     node_id: u32,
@@ -23,6 +25,21 @@ pub const Cluster = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, config: ClusterConfig, sm: ?StateMachine) !Cluster {
+        return initWithPersistence(allocator, config, sm, null);
+    }
+
+    /// Init with an optional durable backend (see raft.RaftPersistence for
+    /// the ownership/lifetime contract). With persistence configured, the
+    /// RaftNode recovers term/vote/log/snapshot from disk, and the state
+    /// machine is seeded here from the recovered snapshot via `restore_fn`
+    /// before any new entry can be applied. Entries after the snapshot
+    /// point re-apply through tick() as they re-commit, per Raft.
+    pub fn initWithPersistence(
+        allocator: std.mem.Allocator,
+        config: ClusterConfig,
+        sm: ?StateMachine,
+        persistence: ?raft.RaftPersistence,
+    ) !Cluster {
         const raft_config = raft.RaftConfig{
             .node_id = config.node_id,
             .peer_count = config.peer_count,
@@ -30,7 +47,22 @@ pub const Cluster = struct {
             .election_timeout_max_ms = config.election_timeout_max_ms,
             .heartbeat_interval_ms = config.heartbeat_interval_ms,
         };
-        const node = try raft.RaftNode.init(allocator, raft_config);
+        var node = try raft.RaftNode.initWithPersistence(allocator, raft_config, persistence);
+        errdefer node.deinit();
+
+        // Seed the application state machine from the recovered snapshot
+        // base (last_applied already points at its lastIncludedIndex, so the
+        // snapshotted prefix is never re-applied — no double execution).
+        if (node.takeRecoveredSnapshot()) |snap_const| {
+            var snap = snap_const;
+            defer snap.deinit();
+            if (sm) |s| {
+                if (s.restore_fn) |restore| {
+                    restore(snap.data);
+                }
+            }
+        }
+
         return .{
             .node = node,
             .state_machine = sm,
@@ -273,6 +305,111 @@ test "Cluster: single-node cluster elects itself and applies proposals" {
     try std.testing.expectEqual(@as(u32, 1), test_applied_count);
     cluster.tick();
     try std.testing.expectEqual(@as(u32, 1), test_applied_count);
+}
+
+// State machine for the persistence test: a counter of applied entries that
+// can be snapshotted to / restored from a single byte.
+var test_counter: u8 = 0;
+
+fn testCounterApply(_: []const u8) void {
+    test_counter += 1;
+}
+
+fn testCounterRestore(snap: []const u8) void {
+    test_counter = if (snap.len > 0) snap[0] else 0;
+}
+
+test "Cluster: persistence — snapshot restores state machine base, tail re-applies exactly once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buf);
+    var wal_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&wal_buf, "{s}/raft.wal", .{dir});
+    var vote_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const vote_path = try std.fmt.bufPrint(&vote_buf, "{s}/vote.state", .{dir});
+
+    const sm = StateMachine{
+        .apply_fn = &testCounterApply,
+        .restore_fn = &testCounterRestore,
+    };
+
+    // Boot 1: apply 3 entries, snapshot the state machine at last_applied=3,
+    // then commit 2 more entries WITHOUT applying them.
+    test_counter = 0;
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var snaps = try snapshot_mod.SnapshotManager.init(std.testing.allocator, .{
+            .base_path = dir,
+        });
+        defer snaps.deinit();
+        var cluster = try Cluster.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 0,
+        }, sm, .{ .wal = &wal, .vote_path = vote_path, .snapshots = &snaps });
+        defer cluster.deinit();
+
+        _ = cluster.node.startElection(); // term 1, single-node leader
+        try std.testing.expect(cluster.isLeader());
+
+        _ = try cluster.propose("a");
+        _ = try cluster.propose("b");
+        _ = try cluster.propose("c");
+        cluster.tick();
+        try std.testing.expectEqual(@as(u8, 3), test_counter);
+
+        // Snapshot the applied state (a single counter byte).
+        try cluster.node.takeSnapshot(&[_]u8{test_counter});
+
+        _ = try cluster.propose("d");
+        _ = try cluster.propose("e");
+        // Committed but deliberately NOT ticked/applied before the "crash".
+        try std.testing.expectEqual(@as(u64, 5), cluster.node.commit_index);
+    }
+
+    // Boot 2: restore_fn seeds the state machine from the snapshot; the
+    // snapshotted prefix (a,b,c) is never re-applied, and the tail (d,e)
+    // re-applies exactly once after it re-commits.
+    test_counter = 0;
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var snaps = try snapshot_mod.SnapshotManager.init(std.testing.allocator, .{
+            .base_path = dir,
+        });
+        defer snaps.deinit();
+        var cluster = try Cluster.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 0,
+        }, sm, .{ .wal = &wal, .vote_path = vote_path, .snapshots = &snaps });
+        defer cluster.deinit();
+
+        // restore_fn already ran with the snapshot data.
+        try std.testing.expectEqual(@as(u8, 3), test_counter);
+        try std.testing.expectEqual(@as(u64, 3), cluster.node.commit_index);
+        try std.testing.expectEqual(@as(u64, 3), cluster.node.last_applied);
+        try std.testing.expectEqual(@as(u64, 5), cluster.node.log.lastIndex());
+
+        // Nothing applicable until the tail re-commits.
+        cluster.tick();
+        try std.testing.expectEqual(@as(u8, 3), test_counter);
+
+        _ = cluster.node.startElection(); // term 2
+        try std.testing.expect(cluster.isLeader());
+        _ = try cluster.propose("f"); // commits 4..6 transitively
+        cluster.tick();
+        // d, e, f applied exactly once on top of the restored base.
+        try std.testing.expectEqual(@as(u8, 6), test_counter);
+        cluster.tick();
+        try std.testing.expectEqual(@as(u8, 6), test_counter);
+    }
 }
 
 test "Cluster: handleMessage delegates to raft node" {

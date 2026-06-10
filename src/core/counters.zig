@@ -90,16 +90,26 @@ pub const CounterSnapshot = struct {
 };
 
 /// A fixed-capacity set of named atomic counters that can be embedded
-/// in any subsystem. All operations are lock-free.
+/// in any subsystem. All operations, including `allocate`, are lock-free
+/// and safe to run concurrently with readers (`forEach`/`snapshot`/
+/// `getByType`).
 pub const CounterSet = struct {
-    /// Atomic counter values.
-    values: [MAX_COUNTERS]std.atomic.Value(i64),
+    /// Atomic counter values, one cache line per slot.
+    values: [MAX_COUNTERS]PaddedValue,
     /// Metadata labels for each slot.
     labels: [MAX_COUNTERS]Label,
-    /// Number of allocated counters.
+    /// Number of allocated counters. Mutated only via atomic CAS in
+    /// `allocate`; concurrent readers load it atomically.
     count: u32,
 
     pub const MAX_COUNTERS: usize = 64;
+
+    /// A single counter slot, padded to a full cache line so adjacent hot
+    /// counters never share a line (false sharing). Mirrors Aeron, which
+    /// pads each counter to a cache line in its counters file.
+    pub const PaddedValue = struct {
+        value: std.atomic.Value(i64) align(std.atomic.cache_line) = std.atomic.Value(i64).init(0),
+    };
 
     pub const Label = struct {
         name: [64]u8 = .{0} ** 64,
@@ -113,7 +123,7 @@ pub const CounterSet = struct {
         var self: CounterSet = undefined;
         self.count = 0;
         for (0..MAX_COUNTERS) |i| {
-            self.values[i] = std.atomic.Value(i64).init(0);
+            self.values[i] = PaddedValue{};
             self.labels[i] = Label{};
         }
         return self;
@@ -121,30 +131,50 @@ pub const CounterSet = struct {
 
     /// Allocate a new counter slot with the given type and display name.
     /// Returns null if the set is full.
+    ///
+    /// Thread-safe: the slot index is claimed with an atomic CAS, the
+    /// label and initial value are fully written, and only then is the
+    /// slot published via a release-store of `active` — so concurrent
+    /// readers never observe a half-initialized slot.
+    ///
+    /// Names longer than 64 bytes are silently truncated to the first
+    /// 64 bytes.
     pub fn allocate(self: *CounterSet, counter_type: CounterType, name: []const u8) ?Counter {
-        if (self.count >= MAX_COUNTERS) return null;
+        // Claim a slot index. CAS (rather than fetchAdd) so `count` never
+        // overshoots MAX_COUNTERS when the set is full.
+        const idx = while (true) {
+            const current = @atomicLoad(u32, &self.count, .monotonic);
+            if (current >= MAX_COUNTERS) return null;
+            if (@cmpxchgWeak(u32, &self.count, current, current + 1, .monotonic, .monotonic) == null) {
+                break current;
+            }
+        };
 
-        const idx = self.count;
-        self.count += 1;
-
-        self.values[idx] = std.atomic.Value(i64).init(0);
+        // Initialize the slot fully before publishing it.
+        self.values[idx].value.store(0, .monotonic);
 
         var label = &self.labels[idx];
         label.counter_type = counter_type;
-        label.active = true;
 
         const copy_len: u8 = @intCast(@min(name.len, 64));
         @memcpy(label.name[0..copy_len], name[0..copy_len]);
         label.name_len = copy_len;
 
-        return Counter{ .value = &self.values[idx] };
+        // Publish: readers acquire-load `active` and therefore see the
+        // label and zeroed value written above.
+        @atomicStore(bool, &label.active, true, .release);
+
+        return Counter{ .value = &self.values[idx].value };
     }
 
     /// Look up a counter by its type. Performs a linear scan over active slots.
     pub fn getByType(self: *CounterSet, counter_type: CounterType) ?Counter {
-        for (0..self.count) |i| {
-            if (self.labels[i].active and self.labels[i].counter_type == counter_type) {
-                return Counter{ .value = &self.values[i] };
+        const n = @atomicLoad(u32, &self.count, .acquire);
+        for (0..n) |i| {
+            if (@atomicLoad(bool, &self.labels[i].active, .acquire) and
+                self.labels[i].counter_type == counter_type)
+            {
+                return Counter{ .value = &self.values[i].value };
             }
         }
         return null;
@@ -155,10 +185,11 @@ pub const CounterSet = struct {
         self: *const CounterSet,
         callback: *const fn (counter_type: CounterType, name: []const u8, value: i64) void,
     ) void {
-        for (0..self.count) |i| {
-            if (self.labels[i].active) {
+        const n = @atomicLoad(u32, &self.count, .acquire);
+        for (0..n) |i| {
+            if (@atomicLoad(bool, &self.labels[i].active, .acquire)) {
                 const label = &self.labels[i];
-                const val = self.values[i].load(.acquire);
+                const val = self.values[i].value.load(.acquire);
                 callback(label.counter_type, label.name[0..label.name_len], val);
             }
         }
@@ -168,15 +199,16 @@ pub const CounterSet = struct {
     /// Returns the number of snapshots written.
     pub fn snapshot(self: *const CounterSet, out: []CounterSnapshot) u32 {
         var written: u32 = 0;
-        for (0..self.count) |i| {
+        const n = @atomicLoad(u32, &self.count, .acquire);
+        for (0..n) |i| {
             if (written >= out.len) break;
-            if (self.labels[i].active) {
+            if (@atomicLoad(bool, &self.labels[i].active, .acquire)) {
                 const label = &self.labels[i];
                 out[written] = CounterSnapshot{
                     .counter_type = label.counter_type,
                     .name = label.name,
                     .name_len = label.name_len,
-                    .value = self.values[i].load(.acquire),
+                    .value = self.values[i].value.load(.acquire),
                 };
                 written += 1;
             }
@@ -186,8 +218,9 @@ pub const CounterSet = struct {
 
     /// Reset all counter values to zero.
     pub fn resetAll(self: *CounterSet) void {
-        for (0..self.count) |i| {
-            self.values[i].store(0, .release);
+        const n = @atomicLoad(u32, &self.count, .acquire);
+        for (0..n) |i| {
+            self.values[i].value.store(0, .release);
         }
     }
 };
@@ -292,7 +325,7 @@ pub const GlobalCounters = struct {
             for (0..section.set.count) |i| {
                 if (!section.set.labels[i].active) continue;
                 const label = &section.set.labels[i];
-                const val = section.set.values[i].load(.acquire);
+                const val = section.set.values[i].value.load(.acquire);
                 const line = std.fmt.bufPrint(
                     buf[offset..],
                     "  {s}: {d}\n",
@@ -471,6 +504,67 @@ test "counter thread safety — concurrent increments" {
     }
 
     try std.testing.expectEqual(@as(i64, num_threads * increments_per_thread), c.get());
+}
+
+test "counter slots are padded to a full cache line (no false sharing)" {
+    // Each slot must occupy at least one whole cache line, and slot
+    // boundaries must be cache-line multiples.
+    try std.testing.expect(@sizeOf(CounterSet.PaddedValue) >= std.atomic.cache_line);
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(CounterSet.PaddedValue) % std.atomic.cache_line);
+    try std.testing.expect(@alignOf(CounterSet.PaddedValue) >= std.atomic.cache_line);
+
+    // Adjacent hot counters must land on different cache lines.
+    var cs = CounterSet.init();
+    const c0 = cs.allocate(.ipc_messages_published, "line0").?;
+    const c1 = cs.allocate(.ipc_messages_polled, "line1").?;
+    const delta = @intFromPtr(c1.value) - @intFromPtr(c0.value);
+    try std.testing.expect(delta >= std.atomic.cache_line);
+
+    // Basic allocate/increment/read round-trip on padded slots.
+    c0.increment();
+    c0.incrementBy(4);
+    c1.set(7);
+    try std.testing.expectEqual(@as(i64, 5), c0.get());
+    try std.testing.expectEqual(@as(i64, 7), c1.get());
+}
+
+test "counter_set allocate is thread-safe" {
+    var cs = CounterSet.init();
+
+    const num_threads = 4;
+    const allocs_per_thread = 8;
+
+    const Worker = struct {
+        fn run(set: *CounterSet, out: *[allocs_per_thread]Counter) void {
+            for (0..allocs_per_thread) |i| {
+                out[i] = set.allocate(@enumFromInt(@as(u16, @intCast(i))), "concurrent").?;
+                out[i].increment();
+            }
+        }
+    };
+
+    var results: [num_threads][allocs_per_thread]Counter = undefined;
+    var threads: [num_threads]std.Thread = undefined;
+    for (0..num_threads) |t| {
+        threads[t] = std.Thread.spawn(.{}, Worker.run, .{ &cs, &results[t] }) catch unreachable;
+    }
+    for (0..num_threads) |t| {
+        threads[t].join();
+    }
+
+    // Every allocation claimed a distinct slot.
+    try std.testing.expectEqual(@as(u32, num_threads * allocs_per_thread), cs.count);
+    for (0..num_threads) |a| {
+        for (0..allocs_per_thread) |b| {
+            try std.testing.expectEqual(@as(i64, 1), results[a][b].get());
+            for (0..num_threads) |c| {
+                for (0..allocs_per_thread) |d| {
+                    if (a == c and b == d) continue;
+                    try std.testing.expect(results[a][b].value != results[c][d].value);
+                }
+            }
+        }
+    }
 }
 
 test "counter_set MAX_COUNTERS limit" {

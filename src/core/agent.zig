@@ -7,8 +7,10 @@ const config = @import("../platform/config.zig");
 /// Agents are function-pointer based to avoid Zig's comptime interface limitations
 /// and allow runtime composition (e.g., CompositeAgent combining multiple agents).
 pub const AgentFn = struct {
-    /// Returns amount of work done (0 = idle).
-    doWorkFn: *const fn (ctx: *anyopaque) u32,
+    /// Returns amount of work done (0 = idle), or an error. Errors are
+    /// counted by `AgentRunner` (`error_count`) and treated as an idle
+    /// cycle; they do not stop the run loop.
+    doWorkFn: *const fn (ctx: *anyopaque) anyerror!u32,
     /// Called on agent start.
     onStartFn: ?*const fn (ctx: *anyopaque) void = null,
     /// Called on agent close.
@@ -18,7 +20,7 @@ pub const AgentFn = struct {
     /// Agent name for debugging.
     name: []const u8 = "unnamed",
 
-    pub fn doWork(self: *const AgentFn) u32 {
+    pub fn doWork(self: *const AgentFn) anyerror!u32 {
         return self.doWorkFn(self.ctx);
     }
 
@@ -53,8 +55,15 @@ pub const AgentRunner = struct {
     }
 
     /// Start the agent on a new thread.
+    /// Returns `error.AlreadyStarted` if the runner already owns a thread
+    /// (a second start would orphan the first one).
     pub fn start(self: *AgentRunner) !void {
+        if (self.thread != null) return error.AlreadyStarted;
+        // The run loop gates on `running`, so it must be set before the
+        // thread can observe it; a failed spawn must not leave the runner
+        // claiming to be running.
         self.running.store(true, .release);
+        errdefer self.running.store(false, .release);
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
@@ -72,7 +81,10 @@ pub const AgentRunner = struct {
         defer self.agent.onClose();
 
         while (self.running.load(.acquire)) {
-            const work_count = self.agent.doWork();
+            const work_count = self.agent.doWork() catch blk: {
+                _ = self.error_count.fetchAdd(1, .monotonic);
+                break :blk 0;
+            };
             self.idle_strategy.idle(work_count);
         }
     }
@@ -112,11 +124,11 @@ pub const CompositeAgent = struct {
         };
     }
 
-    fn doWorkImpl(ctx: *anyopaque) u32 {
+    fn doWorkImpl(ctx: *anyopaque) anyerror!u32 {
         const self: *CompositeAgent = @ptrCast(@alignCast(ctx));
         var total: u32 = 0;
         for (self.agents) |agent| {
-            total += agent.doWork();
+            total += try agent.doWork();
         }
         return total;
     }
@@ -140,38 +152,36 @@ pub const CompositeAgent = struct {
 ///
 /// Measures cycle duration, total work done, and provides statistics
 /// for monitoring agent health and tuning idle strategies.
+///
+/// Timing uses the monotonic clock (`config.monotonicNs`) so NTP slews/
+/// steps of the wall clock cannot corrupt the duty-cycle statistics.
 pub const DutyCycleTracker = struct {
     cycle_count: u64 = 0,
     total_work: u64 = 0,
+    total_cycle_ns: u64 = 0,
     max_cycle_ns: u64 = 0,
     last_cycle_ns: u64 = 0,
     cycle_start_ns: u64 = 0,
 
     pub fn cycleStart(self: *DutyCycleTracker) void {
-        self.cycle_start_ns = config.timestampNs();
+        self.cycle_start_ns = config.monotonicNs();
     }
 
     pub fn cycleEnd(self: *DutyCycleTracker, work_count: u32) void {
-        const now = config.timestampNs();
+        const now = config.monotonicNs();
         const elapsed = now -| self.cycle_start_ns;
         self.last_cycle_ns = elapsed;
+        self.total_cycle_ns += elapsed;
         self.max_cycle_ns = @max(self.max_cycle_ns, elapsed);
         self.cycle_count += 1;
         self.total_work += work_count;
     }
 
+    /// True arithmetic mean of all recorded cycle durations.
+    /// Returns 0 if no cycles have been recorded.
     pub fn averageCycleNs(self: *const DutyCycleTracker) u64 {
         if (self.cycle_count == 0) return 0;
-        // Approximate: we don't track total elapsed, so use max * count as upper bound?
-        // Actually, we need to track total time. Let's derive from total_work ratio instead.
-        // For a proper average, we'd need cumulative elapsed. Use last_cycle_ns as a proxy
-        // or track it. Since we have cycle_count and individual measurements, let's just
-        // return last_cycle_ns as a reasonable recent value. For a real average, we'd
-        // accumulate total_ns. Let's add that.
-        //
-        // For simplicity without adding a field, return 0 if no cycles.
-        // The caller should use the tracker over a window.
-        return self.last_cycle_ns;
+        return self.total_cycle_ns / self.cycle_count;
     }
 
     /// Ratio of cycles that did work vs total cycles (0.0 to 1.0).
@@ -200,7 +210,7 @@ const TestContext = struct {
         };
     }
 
-    fn doWork(ctx: *anyopaque) u32 {
+    fn doWork(ctx: *anyopaque) anyerror!u32 {
         const self: *TestContext = @ptrCast(@alignCast(ctx));
         _ = self.work_done.fetchAdd(1, .monotonic);
         return 1;
@@ -231,11 +241,11 @@ test "AgentFn doWork calls function" {
     var ctx = TestContext.init();
     const agent = ctx.agentFn();
 
-    const result = agent.doWork();
+    const result = try agent.doWork();
     try std.testing.expectEqual(@as(u32, 1), result);
     try std.testing.expectEqual(@as(u32, 1), ctx.work_done.load(.monotonic));
 
-    _ = agent.doWork();
+    _ = try agent.doWork();
     try std.testing.expectEqual(@as(u32, 2), ctx.work_done.load(.monotonic));
 }
 
@@ -303,7 +313,7 @@ test "CompositeAgent aggregates work from multiple agents" {
     const composite_fn = composite.agentFn();
 
     // doWork should call both agents
-    const total = composite_fn.doWork();
+    const total = try composite_fn.doWork();
     try std.testing.expectEqual(@as(u32, 2), total);
     try std.testing.expectEqual(@as(u32, 1), ctx1.work_done.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), ctx2.work_done.load(.monotonic));
@@ -397,6 +407,85 @@ test "AgentFn with null callbacks" {
     agent.onClose();
 
     // doWork should still work
-    const result = agent.doWork();
+    const result = try agent.doWork();
     try std.testing.expectEqual(@as(u32, 1), result);
+}
+
+test "AgentRunner rejects double start" {
+    var ctx = TestContext.init();
+    const agent = ctx.agentFn();
+    var runner = AgentRunner.init(agent, idle_strategy_mod.yielding());
+
+    try runner.start();
+    defer runner.stop();
+
+    // A second start must not orphan the running thread.
+    try std.testing.expectError(error.AlreadyStarted, runner.start());
+    try std.testing.expect(runner.isRunning());
+}
+
+test "AgentRunner counts doWork errors and stops cleanly" {
+    const FailingContext = struct {
+        fn doWork(_: *anyopaque) anyerror!u32 {
+            return error.WorkFailed;
+        }
+    };
+
+    var dummy: u8 = 0;
+    const agent = AgentFn{
+        .doWorkFn = FailingContext.doWork,
+        .ctx = @ptrCast(&dummy),
+        .name = "failing-agent",
+    };
+    var runner = AgentRunner.init(agent, idle_strategy_mod.yielding());
+
+    try std.testing.expectEqual(@as(u64, 0), runner.errorCount());
+    try runner.start();
+
+    // Wait (bounded) until the loop has recorded at least one error.
+    var waited: usize = 0;
+    while (runner.errorCount() == 0 and waited < 1000) : (waited += 1) {
+        std.Thread.sleep(1_000_000); // 1ms
+    }
+
+    runner.stop();
+
+    // Errors were counted, the loop kept going, and the runner shut down
+    // into a consistent state.
+    try std.testing.expect(runner.errorCount() >= 1);
+    try std.testing.expect(!runner.isRunning());
+    try std.testing.expect(runner.thread == null);
+}
+
+test "DutyCycleTracker averageCycleNs is the true arithmetic mean" {
+    // Deterministic: drive the accumulated state directly.
+    var tracker = DutyCycleTracker{};
+    try std.testing.expectEqual(@as(u64, 0), tracker.averageCycleNs());
+
+    tracker.cycle_count = 4;
+    tracker.total_cycle_ns = 100 + 200 + 300 + 400;
+    tracker.last_cycle_ns = 400;
+    try std.testing.expectEqual(@as(u64, 250), tracker.averageCycleNs());
+    // Regression for the old bug: the average is NOT just the last cycle.
+    try std.testing.expect(tracker.averageCycleNs() != tracker.last_cycle_ns);
+}
+
+test "DutyCycleTracker accumulates real cycles into the average" {
+    var tracker = DutyCycleTracker{};
+
+    // Two fast cycles and one >= 1ms cycle.
+    tracker.cycleStart();
+    tracker.cycleEnd(1);
+    tracker.cycleStart();
+    tracker.cycleEnd(0);
+    tracker.cycleStart();
+    std.Thread.sleep(1_000_000); // 1ms
+    tracker.cycleEnd(1);
+
+    try std.testing.expectEqual(@as(u64, 3), tracker.cycle_count);
+    // Mean of 3 cycles, one of which took >= 1ms: at least ~1ms/3.
+    try std.testing.expect(tracker.averageCycleNs() >= 300_000);
+    // Mean is consistent with the accumulated total and bounded by max.
+    try std.testing.expectEqual(tracker.total_cycle_ns / 3, tracker.averageCycleNs());
+    try std.testing.expect(tracker.averageCycleNs() <= tracker.max_cycle_ns);
 }

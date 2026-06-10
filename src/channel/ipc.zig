@@ -253,6 +253,39 @@ pub const IpcChannel = struct {
     /// Calls `handler` for each available frame, up to `limit` frames.
     /// Returns the number of frames read.
     pub fn poll(self: *IpcChannel, handler: *const fn (ReadResult) void, limit: u32) u32 {
+        const Dispatcher = struct {
+            h: *const fn (ReadResult) void,
+            inline fn deliver(d: @This(), result: ReadResult) void {
+                d.h(result);
+            }
+        };
+        return self.pollLoop(Dispatcher{ .h = handler }, limit);
+    }
+
+    /// Poll for available messages, passing an opaque `context` through to
+    /// the handler. Identical semantics to `poll`; this variant lets callers
+    /// carry runtime state (e.g. a user callback) without threadlocals or
+    /// comptime closures.
+    pub fn pollCtx(
+        self: *IpcChannel,
+        context: *anyopaque,
+        handler: *const fn (context: *anyopaque, result: ReadResult) void,
+        limit: u32,
+    ) u32 {
+        const Dispatcher = struct {
+            ctx: *anyopaque,
+            h: *const fn (*anyopaque, ReadResult) void,
+            inline fn deliver(d: @This(), result: ReadResult) void {
+                d.h(d.ctx, result);
+            }
+        };
+        return self.pollLoop(Dispatcher{ .ctx = context, .h = handler }, limit);
+    }
+
+    /// Shared poll loop for `poll`/`pollCtx`. Inlined with a comptime
+    /// dispatcher so both public entry points compile to the original
+    /// hardened loop with no extra indirection.
+    inline fn pollLoop(self: *IpcChannel, dispatcher: anytype, limit: u32) u32 {
         var count: u32 = 0;
         var head = self.meta.head_position.load(.monotonic);
         const tail = self.meta.tail_position.load(.acquire);
@@ -299,7 +332,7 @@ pub const IpcChannel = struct {
             const payload = (buf + frame.FrameHeader.SIZE)[0..payload_len];
             const hdr_type_ptr: *const i32 = @ptrCast(@alignCast(buf + 4));
 
-            handler(.{
+            dispatcher.deliver(.{
                 .data = payload,
                 .msg_type_id = hdr_type_ptr.*,
             });
@@ -364,6 +397,36 @@ test "IpcChannel publish/poll roundtrip verifies data" {
     try std.testing.expect(S.received_data != null);
     try std.testing.expectEqualStrings("roundtrip test", S.received_data.?);
     try std.testing.expectEqual(@as(i32, 99), S.received_type);
+}
+
+test "IpcChannel pollCtx passes context through to handler" {
+    const name = "/zigbolt_test_ipc_pollctx";
+
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
+    defer ch.deinit();
+
+    try ch.publish("ctx one", 11);
+    try ch.publish("ctx two", 22);
+
+    const Ctx = struct {
+        delivered: u32 = 0,
+        bytes: usize = 0,
+        type_sum: i32 = 0,
+
+        fn dispatch(context: *anyopaque, result: IpcChannel.ReadResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.delivered += 1;
+            self.bytes += result.data.len;
+            self.type_sum += result.msg_type_id;
+        }
+    };
+
+    var ctx = Ctx{};
+    const count = ch.pollCtx(@ptrCast(&ctx), &Ctx.dispatch, 10);
+    try std.testing.expectEqual(@as(u32, 2), count);
+    try std.testing.expectEqual(@as(u32, 2), ctx.delivered);
+    try std.testing.expectEqual(@as(usize, "ctx one".len + "ctx two".len), ctx.bytes);
+    try std.testing.expectEqual(@as(i32, 33), ctx.type_sum);
 }
 
 test "IpcChannel multiple messages" {

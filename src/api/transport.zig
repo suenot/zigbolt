@@ -73,12 +73,14 @@ pub const Transport = struct {
         return sub_mod.RawSubscriber.init(ch);
     }
 
-    /// Shut down the transport and release all resources.
+    /// Shut down the transport and release all resources,
+    /// including the duplicated channel-name keys.
     pub fn deinit(self: *Transport) void {
-        var it = self.channels.valueIterator();
-        while (it.next()) |ch_ptr| {
-            ch_ptr.*.deinit();
-            self.allocator.destroy(ch_ptr.*);
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
         }
         self.channels.deinit();
     }
@@ -89,12 +91,16 @@ pub const Transport = struct {
         if (self.channels.get(name)) |ch| return ch;
 
         const ch = try self.allocator.create(IpcChannel);
+        errdefer self.allocator.destroy(ch);
+
         ch.* = try IpcChannel.create(name.ptr, .{
             .term_length = self.config.term_length,
             .use_hugepages = self.config.use_hugepages,
             .pre_fault = self.config.pre_fault,
         });
-        try self.channels.put(name, ch);
+        errdefer ch.deinit();
+
+        try self.putOwnedKey(name, ch);
         return ch;
     }
 
@@ -102,11 +108,25 @@ pub const Transport = struct {
         if (self.channels.get(name)) |ch| return ch;
 
         const ch = try self.allocator.create(IpcChannel);
+        errdefer self.allocator.destroy(ch);
+
         ch.* = try IpcChannel.open(name.ptr, .{
             .term_length = self.config.term_length,
         });
-        try self.channels.put(name, ch);
+        errdefer ch.deinit();
+
+        try self.putOwnedKey(name, ch);
         return ch;
+    }
+
+    /// Insert `ch` under a copy of `name` owned by the transport allocator.
+    /// The caller's `name` may be a temporary (e.g. heap-formatted); using
+    /// it directly as the map key would leave a dangling key after the
+    /// caller frees it (use-after-free on later get/deinit).
+    fn putOwnedKey(self: *Transport, name: []const u8, ch: *IpcChannel) !void {
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        try self.channels.put(owned_name, ch);
     }
 };
 
@@ -151,4 +171,50 @@ test "Transport addRawPublication reuses channel" {
 
     // Same channel name should reuse the same channel
     try std.testing.expectEqual(@as(u32, 1), transport.channels.count());
+}
+
+test "Transport owns its channel-name keys (temporary name survives free)" {
+    var transport = Transport.init(std.testing.allocator, .{ .term_length = 4096 });
+    defer transport.deinit();
+
+    // Heap-formatted temporary name, freed right after registration.
+    const tmp_name = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/zigbolt_test_transport_key_{d}",
+        .{42},
+        0,
+    );
+    var pub_inst = blk: {
+        defer std.testing.allocator.free(tmp_name);
+        break :blk try transport.addRawPublication(tmp_name, 1);
+    };
+    try pub_inst.offer("owned key");
+
+    // Look the channel up via a fresh, equal string: must hit the same
+    // entry (key was duped, not dangling).
+    const lookup_name = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/zigbolt_test_transport_key_{d}",
+        .{42},
+        0,
+    );
+    defer std.testing.allocator.free(lookup_name);
+    _ = try transport.addRawPublication(lookup_name, 2);
+    try std.testing.expectEqual(@as(u32, 1), transport.channels.count());
+    // deinit (via defer) must free the duped key — the testing allocator
+    // fails the test on any leak or use-after-free.
+}
+
+test "Transport channel factory does not leak on open failure" {
+    var transport = Transport.init(std.testing.allocator, .{ .term_length = 4096 });
+    defer transport.deinit();
+
+    // Opening a channel that no one created must fail cleanly: the
+    // errdefer path frees the IpcChannel struct (the testing allocator
+    // fails the test on a leak) and no map entry is left behind.
+    try std.testing.expectError(
+        error.ShmOpenFailed,
+        transport.addRawSubscription("/zigbolt_test_transport_noexist"),
+    );
+    try std.testing.expectEqual(@as(u32, 0), transport.channels.count());
 }

@@ -804,6 +804,166 @@ test "reassembler caps coverage ranges per message" {
     try std.testing.expect((try reassembler.processFragment(3, fragAt(10), &payload)) == null);
 }
 
+test "Fragmenter.fragment emits every fragment via the callback" {
+    const fragmenter = Fragmenter.init(.{ .mtu = 100 }); // 84-byte payloads
+
+    var msg: [200]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    const S = struct {
+        var count: u32 = 0;
+        var bytes: usize = 0;
+        var begin_seen = false;
+        var end_seen = false;
+        fn emit(header: FragmentHeader, payload: []const u8) void {
+            count += 1;
+            bytes += payload.len;
+            if (header.flags.begin) begin_seen = true;
+            if (header.flags.end) end_seen = true;
+        }
+    };
+    S.count = 0;
+    S.bytes = 0;
+    S.begin_seen = false;
+    S.end_seen = false;
+
+    fragmenter.fragment(&msg, 11, &S.emit);
+
+    try std.testing.expectEqual(@as(u32, 3), S.count); // 84 + 84 + 32
+    try std.testing.expectEqual(@as(usize, 200), S.bytes);
+    try std.testing.expect(S.begin_seen);
+    try std.testing.expect(S.end_seen);
+}
+
+test "reassembler rejects payload length mismatching the header" {
+    const allocator = std.testing.allocator;
+    var reassembler = Reassembler.init(allocator, .{ .mtu = 100, .max_message_size = 1 << 20 });
+    defer reassembler.deinit();
+
+    // Header claims 20 bytes; only 10 arrive.
+    const header = FragmentHeader{
+        .total_length = 100,
+        .fragment_offset = 0,
+        .fragment_length = 20,
+        .flags = .{ .begin = true },
+    };
+    try std.testing.expectError(
+        error.LengthMismatch,
+        reassembler.processFragment(1, header, "0123456789"),
+    );
+}
+
+test "reassembler rejects inconsistent total_length across fragments" {
+    const allocator = std.testing.allocator;
+    var reassembler = Reassembler.init(allocator, .{ .mtu = 100, .max_message_size = 1 << 20 });
+    defer reassembler.deinit();
+
+    var payload: [84]u8 = undefined;
+    @memset(&payload, 0x77);
+
+    const first = FragmentHeader{
+        .total_length = 200,
+        .fragment_offset = 0,
+        .fragment_length = 84,
+        .flags = .{ .begin = true },
+    };
+    try std.testing.expect((try reassembler.processFragment(4, first, &payload)) == null);
+
+    // Same message key, different claimed total: hostile or corrupt.
+    const liar = FragmentHeader{
+        .total_length = 300,
+        .fragment_offset = 84,
+        .fragment_length = 84,
+        .flags = .{},
+    };
+    try std.testing.expectError(
+        error.InconsistentTotalLength,
+        reassembler.processFragment(4, liar, &payload),
+    );
+}
+
+test "reassembler merges a gap-filling fragment with both neighbours" {
+    const allocator = std.testing.allocator;
+    var reassembler = Reassembler.init(allocator, .{ .mtu = 100, .max_message_size = 1 << 20 });
+    defer reassembler.deinit();
+
+    var payload: [10]u8 = undefined;
+    @memset(&payload, 0x42);
+
+    const fragAt = struct {
+        fn make(offset: u32) FragmentHeader {
+            return .{
+                .total_length = 1000,
+                .fragment_offset = offset,
+                .fragment_length = 10,
+                .flags = .{},
+            };
+        }
+    }.make;
+
+    // Ranges [0,10) and [20,30), then the exact middle [10,20): the three
+    // must collapse into a single [0,30) range.
+    try std.testing.expect((try reassembler.processFragment(6, fragAt(0), &payload)) == null);
+    try std.testing.expect((try reassembler.processFragment(6, fragAt(20), &payload)) == null);
+    try std.testing.expectEqual(@as(usize, 2), reassembler.pending.getPtr(6).?.ranges.items.len);
+
+    try std.testing.expect((try reassembler.processFragment(6, fragAt(10), &payload)) == null);
+    const buf = reassembler.pending.getPtr(6).?;
+    try std.testing.expectEqual(@as(usize, 1), buf.ranges.items.len);
+    try std.testing.expectEqual(@as(u32, 0), buf.ranges.items[0].start);
+    try std.testing.expectEqual(@as(u32, 30), buf.ranges.items[0].end);
+    try std.testing.expectEqual(@as(u32, 30), buf.covered);
+}
+
+test "cleanStale evicts aged pending entries" {
+    const allocator = std.testing.allocator;
+    var reassembler = Reassembler.init(allocator, .{ .mtu = 100, .max_message_size = 1 << 20 });
+    defer reassembler.deinit();
+
+    var payload: [84]u8 = undefined;
+    @memset(&payload, 0x55);
+    const header = FragmentHeader{
+        .total_length = 200,
+        .fragment_offset = 0,
+        .fragment_length = 84,
+        .flags = .{ .begin = true },
+    };
+    try std.testing.expect((try reassembler.processFragment(1, header, &payload)) == null);
+    try std.testing.expectEqual(@as(u32, 1), reassembler.pending.count());
+
+    // Entry far younger than an hour: kept.
+    reassembler.cleanStale(60 * 60 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u32, 1), reassembler.pending.count());
+
+    // After aging past a 1 ns deadline: evicted.
+    std.Thread.sleep(2_000_000); // 2 ms
+    reassembler.cleanStale(1);
+    try std.testing.expectEqual(@as(u32, 0), reassembler.pending.count());
+    try std.testing.expectEqual(@as(usize, 0), reassembler.pending_bytes);
+}
+
+test "reassembler survives allocation failure at every point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var reassembler = Reassembler.init(allocator, .{ .mtu = 100, .max_message_size = 1 << 20 });
+            defer reassembler.deinit();
+
+            var payload: [84]u8 = undefined;
+            @memset(&payload, 0x66);
+            const header = FragmentHeader{
+                .total_length = 200,
+                .fragment_offset = 0,
+                .fragment_length = 84,
+                .flags = .{ .begin = true },
+            };
+            // Propagate OOM (under test: the buffer-free errdefer when the
+            // pending insertion fails); swallow nothing else — this input
+            // is valid and can only fail on allocation.
+            _ = try reassembler.processFragment(1, header, &payload);
+        }
+    }.run, .{});
+}
+
 test "maxPayloadPerFragment calculation" {
     const f1 = Fragmenter.init(.{ .mtu = 100 });
     try std.testing.expectEqual(@as(u32, 84), f1.maxPayloadPerFragment()); // 100 - 16

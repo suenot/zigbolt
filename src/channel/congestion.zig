@@ -678,6 +678,57 @@ test "NakController backoff shift is clamped at 63" {
     _ = nak.shouldSendNak(std.math.maxInt(u64));
 }
 
+test "RTT estimator handles decreasing samples and exposes getters" {
+    var rtt = RttEstimator.init();
+
+    rtt.update(50_000_000);
+    // Sample below SRTT: |SRTT - R| takes the srtt - rtt branch.
+    rtt.update(10_000_000);
+
+    try std.testing.expect(rtt.srtt_ns < 50_000_000);
+    try std.testing.expect(rtt.srtt_ns > 10_000_000);
+    try std.testing.expectEqual(@as(u64, 10_000_000), rtt.min_rtt_ns);
+
+    // Getters mirror the internal fields.
+    try std.testing.expectEqual(rtt.srtt_ns, rtt.smoothedRtt());
+    try std.testing.expectEqual(rtt.rto_ns, rtt.retransmitTimeout());
+    try std.testing.expect(rtt.retransmitTimeout() >= rtt.smoothedRtt());
+}
+
+test "CongestionControl reset restores initial dynamic state" {
+    var cc = CongestionControl.init(.{
+        .initial_window = 8192,
+        .initial_ssthresh = 512 * 1024,
+        .mss = 1000,
+        .min_window = 2048,
+        .max_window = 8 * 1024 * 1024,
+    });
+
+    // Dirty every piece of dynamic state.
+    cc.onSend(5000);
+    cc.onLoss();
+    cc.onTimeout();
+    cc.onAck(100);
+    try std.testing.expect(cc.total_sent > 0);
+    try std.testing.expect(cc.total_retransmits > 0);
+
+    cc.reset();
+
+    // Dynamic state back to the documented initial values.
+    try std.testing.expectEqual(@as(u64, 64 * 1024), cc.cwnd);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), cc.ssthresh);
+    try std.testing.expect(cc.in_slow_start);
+    try std.testing.expectEqual(@as(u64, 0), cc.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 0), cc.total_sent);
+    try std.testing.expectEqual(@as(u64, 0), cc.total_retransmits);
+    try std.testing.expectEqual(@as(u32, 0), cc.loss_count);
+
+    // Static configuration survives the reset.
+    try std.testing.expectEqual(@as(u32, 1000), cc.mss);
+    try std.testing.expectEqual(@as(u64, 2048), cc.min_window);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), cc.max_window);
+}
+
 test "window never exceeds maximum" {
     var cc = CongestionControl.init(.{
         .initial_window = 1024 * 1024,

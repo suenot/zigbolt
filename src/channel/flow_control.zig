@@ -925,6 +925,121 @@ test "TaggedFlowControl — full table evicts least-recently-seen entry" {
     try std.testing.expect(fc.hasRequiredReceivers());
 }
 
+test "TaggedFlowControl — re-registration updates position and tag" {
+    var fc = TaggedFlowControl{};
+    fc.required_group_tag = 7;
+
+    const first = ReceiverStatus{
+        .session_id = 1,
+        .stream_id = 1,
+        .consumption_term_id = 0,
+        .consumption_term_offset = 100,
+        .receiver_window_length = 100,
+        .receiver_id = 5,
+        .timestamp_ns = 1000,
+    };
+    _ = fc.onStatusMessageTagged(first, 7, 0, 0, 16, 1000);
+    try std.testing.expectEqual(@as(u32, 1), fc.receiver_count);
+    try std.testing.expect(fc.hasRequiredReceivers());
+
+    // Same receiver_id again: the existing slot is updated, not duplicated.
+    const second = ReceiverStatus{
+        .session_id = 1,
+        .stream_id = 1,
+        .consumption_term_id = 0,
+        .consumption_term_offset = 400,
+        .receiver_window_length = 100,
+        .receiver_id = 5,
+        .timestamp_ns = 2000,
+    };
+    const limit = fc.onStatusMessageTagged(second, 7, 0, 0, 16, 2000);
+    try std.testing.expectEqual(@as(u32, 1), fc.receiver_count);
+    try std.testing.expectEqual(@as(i64, 500), limit);
+
+    // A re-registration may also change the tag: dropping the required tag
+    // releases the sender (fallback limit), same receiver count.
+    const retagged = fc.onStatusMessageTagged(second, 8, 12345, 0, 16, 3000);
+    try std.testing.expectEqual(@as(u32, 1), fc.receiver_count);
+    try std.testing.expectEqual(@as(i64, 12345), retagged);
+    try std.testing.expect(!fc.hasRequiredReceivers());
+}
+
+test "FlowControl — tagged strategy dispatch and convenience wrapper" {
+    var fc = FlowControl.init(.{
+        .strategy = .tagged,
+        .required_group_tag = 123,
+        .receiver_timeout_ns = 1000,
+    });
+
+    // The wrapper uses receiver_id as the group tag: id 123 matches.
+    const matching = ReceiverStatus{
+        .session_id = 1,
+        .stream_id = 1,
+        .consumption_term_id = 0,
+        .consumption_term_offset = 500,
+        .receiver_window_length = 1000,
+        .receiver_id = 123,
+        .timestamp_ns = 1000,
+    };
+    const limit = fc.onStatusMessage(matching, 0, 0, 16, 1000);
+    try std.testing.expectEqual(@as(i64, 1500), limit);
+    try std.testing.expect(fc.hasRequiredReceivers());
+
+    // id != required tag: tracked, but the fallback limit is returned.
+    const other = ReceiverStatus{
+        .session_id = 1,
+        .stream_id = 1,
+        .consumption_term_id = 0,
+        .consumption_term_offset = 100,
+        .receiver_window_length = 100,
+        .receiver_id = 55,
+        .timestamp_ns = 1000,
+    };
+    var fc2 = FlowControl.init(.{ .strategy = .tagged, .required_group_tag = 123 });
+    const fallback = fc2.onStatusMessage(other, 777, 0, 16, 1000);
+    try std.testing.expectEqual(@as(i64, 777), fallback);
+    try std.testing.expect(!fc2.hasRequiredReceivers());
+}
+
+test "FlowControl — onIdle dispatches for every strategy; tagged onIdle times out" {
+    // min: no receivers -> fallback.
+    var fc_min = FlowControl.init(.{ .strategy = .min });
+    try std.testing.expectEqual(@as(i64, 77), fc_min.onIdle(1000, 77, 0, false));
+
+    // max: sender_position + window, regardless of receivers.
+    var fc_max = FlowControl.init(.{ .strategy = .max, .initial_receiver_window = 1024 });
+    try std.testing.expectEqual(@as(i64, 5000 + 1024), fc_max.onIdle(1000, 0, 5000, false));
+
+    // tagged: a registered receiver constrains until it times out.
+    var fc_t = FlowControl.init(.{
+        .strategy = .tagged,
+        .required_group_tag = 9,
+        .receiver_timeout_ns = 100,
+    });
+    const status = ReceiverStatus{
+        .session_id = 1,
+        .stream_id = 1,
+        .consumption_term_id = 0,
+        .consumption_term_offset = 100,
+        .receiver_window_length = 100,
+        .receiver_id = 9, // wrapper convention: id is also the tag
+        .timestamp_ns = 1000,
+    };
+    _ = fc_t.onStatusMessage(status, 0, 0, 16, 1000);
+    try std.testing.expect(fc_t.hasRequiredReceivers());
+
+    // Within the timeout: receiver still limits.
+    try std.testing.expectEqual(@as(i64, 200), fc_t.onIdle(1050, 0, 0, false));
+
+    // Past the timeout: removed; fallback returned.
+    try std.testing.expectEqual(@as(i64, 42), fc_t.onIdle(2000, 42, 0, false));
+    try std.testing.expect(!fc_t.hasRequiredReceivers());
+    switch (fc_t.strategy) {
+        .tagged => |s| try std.testing.expectEqual(@as(u32, 0), s.receiver_count),
+        else => unreachable,
+    }
+}
+
 test "FlowControlConfig defaults" {
     const cfg = FlowControlConfig{};
     try std.testing.expectEqual(FlowControlConfig.StrategyType.min, cfg.strategy);

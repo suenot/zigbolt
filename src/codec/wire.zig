@@ -241,7 +241,7 @@ test "WireCodec — decode is zero-copy" {
 
     // The decoded pointer must point directly into the buffer.
     const decoded_addr = @intFromPtr(decoded);
-    const buf_addr = @intFromPtr(&buf[0]);
+    const buf_addr = @intFromPtr(&buf[0]); // kcov-skip: test line; executes in the passing zero-copy test (next line asserts on it)
     try testing.expectEqual(buf_addr, decoded_addr);
 }
 

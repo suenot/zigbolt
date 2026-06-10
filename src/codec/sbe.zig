@@ -214,7 +214,7 @@ pub const SbeEncoder = struct {
     pub fn putU8(self: *SbeEncoder, val: u8) !void {
         if (self.pos + 1 > self.buf.len) return error.BufferOverflow;
         self.buf[self.pos] = val;
-        self.pos += 1;
+        self.pos += 1; // kcov-skip: putU8 body; called+asserted in primitive roundtrip tests, no own line record
     }
 
     pub fn putU16(self: *SbeEncoder, val: u16) !void {
@@ -259,13 +259,13 @@ pub const SbeEncoder = struct {
     pub fn putF64(self: *SbeEncoder, val: f64) !void {
         if (self.pos + 8 > self.buf.len) return error.BufferOverflow;
         const bits: u64 = @bitCast(val);
-        self.writeU64(bits);
+        self.writeU64(bits); // kcov-skip: putF64 body; called+asserted in primitive roundtrip tests, no own line record
     }
 
     pub fn putF32(self: *SbeEncoder, val: f32) !void {
         if (self.pos + 4 > self.buf.len) return error.BufferOverflow;
         const bits: u32 = @bitCast(val);
-        self.writeU32(bits);
+        self.writeU32(bits); // kcov-skip: putF32 body; called+asserted in primitive roundtrip tests, no own line record
     }
 
     pub fn putChar(self: *SbeEncoder, val: u8) !void {
@@ -469,7 +469,7 @@ pub const SbeDecoder = struct {
     pub fn getBytes(self: *SbeDecoder, comptime N: usize) !*const [N]u8 {
         if (self.pos + N > self.buf.len) return error.BufferOverflow;
         const ptr: *const [N]u8 = @ptrCast(self.buf[self.pos..][0..N]);
-        self.pos += N;
+        self.pos += N; // kcov-skip: getBytes body; called+asserted in fixed-bytes test, no own line record
         return ptr;
     }
 
@@ -498,7 +498,7 @@ pub const SbeDecoder = struct {
             }]),
             2 => blk: {
                 const v = std.mem.readInt(Tag, self.buf[self.pos..][0..2], .little);
-                self.pos += 2;
+                self.pos += 2; // kcov-skip: 2-byte getEnum branch; exercised by TestOrdType decode assertions, no own line record
                 break :blk v;
             },
             4 => blk: {
@@ -532,7 +532,7 @@ pub const SbeDecoder = struct {
 
     fn readU32(self: *SbeDecoder) u32 {
         const val = std.mem.readInt(u32, self.buf[self.pos..][0..4], .little);
-        self.pos += 4;
+        self.pos += 4; // kcov-skip: readU32 helper; exercised via getU32/getF32/getVarData assertions, no own line record
         return val;
     }
 
@@ -580,7 +580,7 @@ pub fn blockSize(fields: []const FieldDef) usize {
     for (fields) |f| {
         size += fieldWireSize(f);
     }
-    return size;
+    return size; // kcov-skip: blockSize return; result asserted in blockSize tests, no own line record
 }
 
 // ============================================================================
@@ -943,7 +943,7 @@ test "SBE — encoder buffer overflow" {
 test "SBE — decoder buffer overflow" {
     var buf: [2]u8 = undefined;
     buf[0] = 0;
-    buf[1] = 0;
+    buf[1] = 0; // kcov-skip: test line; executes in the passing decoder-overflow test
 
     var dec = SbeDecoder.init(&buf);
     _ = try dec.getU16();
@@ -1110,4 +1110,18 @@ test "SBE — comptime schema definition" {
     try testing.expectEqual(@as(usize, 8), blockSize(new_order.groups[0].fields));
     try testing.expectEqual(@as(usize, 1), new_order.var_data.len);
     try testing.expectEqualStrings("NewOrderSingle", new_order.name);
+}
+
+test "SBE — getBytesSlice zero-copy with runtime length" {
+    var buf: [16]u8 = undefined;
+    var enc = SbeEncoder.init(&buf);
+    try enc.putBytes("hello world!");
+
+    var dec = SbeDecoder.init(&buf);
+    const s = try dec.getBytesSlice(12);
+    try testing.expectEqualStrings("hello world!", s);
+    // Zero-copy: the slice aliases the underlying buffer.
+    try testing.expectEqual(@intFromPtr(&buf[0]), @intFromPtr(s.ptr));
+    // Reading past the remaining bytes fails.
+    try testing.expectError(error.BufferOverflow, dec.getBytesSlice(5));
 }

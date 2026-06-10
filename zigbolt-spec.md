@@ -4,9 +4,36 @@
 
 ---
 
+## ⚠️ Implementation Status (read this first)
+
+This document is the original **design specification / vision**. It mixes what is
+already implemented with what is still planned. It does **not** describe the
+current behavior of the code wherever a section is marked *planned*. Sections
+below carry inline `> Status:` notes; the summary as of **v0.2.1**:
+
+**Implemented (in `src/`, 423 passing tests):**
+- Lock-free SPSC/MPSC ring buffers, triple-term LogBuffer, BroadcastBuffer (1-to-N), idle strategies, agent pattern, shared counters
+- Comptime `WireCodec(T)`, SBE codec engine, FIX/SBE messages
+- IPC shared-memory channel, UDP unicast/multicast channel, reliable `NetworkChannel` (NAK retransmission, **AIMD** congestion control, Min/Max/Tagged flow control, fragmentation/reassembly end-to-end)
+- Aeron-compatible wire protocol flyweights
+- Archive: segment-based record/replay, catalog, sparse index; LZ4-style compression module (standalone — not yet wired into the archive recording path)
+- Raft cluster: leader election, log replication, state machine, WAL (CRC32), snapshots, crash recovery; standalone `Sequencer` / `MultiStreamSequencer`
+- C-ABI FFI (`zig build` produces `zig-out/lib/libzigbolt.{dylib/so,a}`) + C/Go/Python/Rust/TS bindings
+- Benchmark suite (ping-pong, throughput, UDP RTT, SPSC/MPSC latency, codec, logbuffer, IPC multi-size, suite runner with JSON output)
+
+**Planned / vision (NOT implemented yet):**
+- io_uring / DPDK / AF_XDP / RDMA network backends (only a `supports_io_uring` platform constant exists)
+- Archive: io_uring disk I/O, on-the-fly compression config, Parquet export, QuestDB ILP streaming
+- Cluster: Multi-Raft, pre-vote, read-index, batch-commit / pipeline-replication options
+- Memory/OS: hugepage size selection (2MB/1GB), NUMA-aware allocation, `ThreadConfig` (CPU affinity, SCHED_FIFO)
+- Sequencer replicated through Raft, rdtsc hardware timestamps
+- Jitter benchmark
+
+---
+
 ## Executive Summary
 
-ZigBolt — система передачи сообщений на Zig, спроектированная как прямой конкурент Aeron (Real Logic / Adaptive) для high-frequency trading. Ключевое конкурентное преимущество: zero-runtime-overhead (нет GC, нет JVM safepoints), comptime-генерируемые кодеки (замена SBE), нативная поддержка io_uring и kernel bypass (DPDK/AF_XDP), предсказуемая наносекундная латентность без tail latency спайков.
+ZigBolt — система передачи сообщений на Zig, спроектированная как прямой конкурент Aeron (Real Logic / Adaptive) для high-frequency trading. Ключевое конкурентное преимущество: zero-runtime-overhead (нет GC, нет JVM safepoints), comptime-генерируемые кодеки (замена SBE), нативная поддержка io_uring и kernel bypass (DPDK/AF_XDP — *planned, см. Implementation Status*), предсказуемая наносекундная латентность без tail latency спайков.
 
 ### Почему Zig, а не C/C++/Rust?
 
@@ -221,6 +248,9 @@ pub const IpcChannel = struct {
 
 #### 2.2.5 Network Channel — io_uring backend
 
+> **Status: planned, not yet implemented.** The current network layer is the
+> POSIX-socket `UdpChannel` + reliable `NetworkChannel` (`src/channel/`).
+
 ```zig
 pub const IoUringChannel = struct {
     ring: std.os.linux.IoUring,
@@ -251,6 +281,8 @@ pub const IoUringChannel = struct {
 ```
 
 #### 2.2.6 DPDK Backend (kernel bypass)
+
+> **Status: planned, not yet implemented.**
 
 ```zig
 // Trivial C interop через @cImport
@@ -286,6 +318,8 @@ pub const DpdkChannel = struct {
 ```
 
 #### 2.2.7 AF_XDP Backend (kernel-integrated bypass)
+
+> **Status: planned, not yet implemented.**
 
 ```zig
 // AF_XDP: performance close to DPDK, but keeps kernel networking tools
@@ -382,6 +416,12 @@ var msg = codec.decode(buffer[offset..]);
 
 ### 2.4 ZigBolt Archive
 
+> **Status: partially implemented.** Segment-based record/replay with sync
+> policies, catalog and sparse index exist (`src/archive/`). The io_uring disk
+> I/O, the `compression`/`max_disk_usage` config options, Parquet export and
+> QuestDB ILP streaming below are **planned**. The actual
+> `ArchiveConfig` is `{ segment_size, base_path, sync_policy, sync_interval_ms }`.
+
 ```zig
 pub const Archive = struct {
     // Подписывается на Transport publications
@@ -433,6 +473,12 @@ pub const Archive = struct {
 4. **Segment prefetch** — io_uring readahead для replay без stall'ов
 
 ### 2.5 ZigBolt Cluster
+
+> **Status: partially implemented.** Raft leader election, log replication,
+> state machine application, WAL persistence and snapshots exist
+> (`src/cluster/`). The `batch_commit`, `pipeline_replication`, `pre_vote`,
+> `read_index` options, `ProposeFuture`, and **MultiRaft** below are
+> **planned** — the current API is `Cluster.init/propose/handleMessage/tick`.
 
 ```zig
 pub const Cluster = struct {
@@ -495,6 +541,12 @@ pub const Cluster = struct {
 
 ### 2.6 ZigBolt Sequencer
 
+> **Status: partially implemented.** A standalone in-process
+> `Sequencer`/`MultiStreamSequencer` exists (`src/sequencer/sequencer.zig`).
+> Replication of sequenced events **through Raft** (`cluster.propose`) and
+> `rdtsc` hardware timestamps below are **planned** — the current
+> implementation uses an atomic counter and `timestampNs()`.
+
 ```zig
 pub const Sequencer = struct {
     // Total ordering для capital markets
@@ -552,6 +604,11 @@ pub const Sequencer = struct {
 
 ### 3.1 Memory Management
 
+> **Status: partially implemented.** The actual `MemoryConfig`
+> (`src/platform/memory.zig`) is `{ use_hugepages, pre_fault, mlock }`.
+> Hugepage **size** selection (2MB/1GB) and NUMA-aware allocation below are
+> **planned**.
+
 ```zig
 pub const MemoryConfig = struct {
     // Hugepages: 2MB или 1GB
@@ -577,6 +634,10 @@ pub fn allocateSharedMemory(config: MemoryConfig, size: usize) !SharedRegion {
 ```
 
 ### 3.2 CPU Affinity & Isolation
+
+> **Status: planned.** No `ThreadConfig` / affinity / SCHED_FIFO API exists in
+> the code yet; only the idle strategies (busy-spin/yield/backoff/sleep) are
+> implemented (`src/core/idle_strategy.zig`).
 
 ```zig
 pub const ThreadConfig = struct {
@@ -668,35 +729,39 @@ pub fn MpscRingBuffer(comptime T: type, comptime capacity: usize) type {
 
 ### 3.4 Reliability Protocol (UDP)
 
+> **Status: implemented** (`src/channel/reliability.zig`, `congestion.zig`,
+> `network.zig`), with the wire layouts below corrected to match the code.
+
 ```zig
 pub const ReliabilityProtocol = struct {
-    // NAK-based reliable multicast (как Aeron)
+    // NAK-based reliable UDP (как Aeron)
     // + улучшения для trading workloads
-    
-    // Frame header layout (16 bytes):
-    // [0:4]   frame_length: u32
-    // [4:8]   session_id: u32
-    // [8:12]  stream_id: u32
-    // [12:16] term_offset: u32
-    
-    pub const FrameHeader = packed struct {
-        frame_length: u32,
-        session_id: u32,
-        stream_id: u32,
-        term_offset: u32,
-    };
-    
-    // Loss detection: receiver tracks gaps in term_offset
-    // NAK: receiver sends back [stream_id, term_id, term_offset, length]
-    // Retransmission: sender re-reads from log buffer (zero-copy)
-    
+
+    // Реальный core frame header — 8 байт (src/core/frame.zig):
+    // [0:4] frame_length: i32  (>0 data, <0 padding, =0 uncommitted)
+    // [4:8] msg_type_id:  i32
+    //
+    // Для UDP reliability каждый датаграм дополнительно несёт NetworkHeader
+    // (src/channel/reliability.zig): version, header_type
+    // (data/nak/heartbeat/setup/teardown), session_id, stream_id,
+    // sequence (u64), payload_length.
+    //
+    // (Ранний драфт описывал единый 16-байтовый
+    // frame_length/session_id/stream_id/term_offset header — это
+    // возможный v2-layout, НЕ текущий формат.)
+
+    // Loss detection: receiver tracks gaps in sequence space (bitmap RecvTracker)
+    // NAK: receiver sends back [session_id, stream_id, from_sequence, count]
+    // Retransmission: sender re-sends из SendBuffer (rate-limited)
+
     // Flow control: credit-based
     // Receiver grants credits (bytes it can accept)
-    // Publisher backs off when credits exhausted (returns BACK_PRESSURED)
-    
-    // Congestion control: не TCP-style AIMD
-    // Static window для co-location (известная bandwidth)
-    // Adaptive window для cloud/WAN
+    // Publisher backs off when credits exhausted (returns error.BackPressured)
+
+    // Congestion control: TCP-style AIMD (src/channel/congestion.zig) —
+    // slow start + congestion avoidance, multiplicative decrease на loss,
+    // RTT estimation по RFC 6298. (Ранний драфт предлагал static window
+    // для co-location — это осталось идеей для будущего профиля.)
 };
 ```
 
@@ -719,6 +784,11 @@ pub const ReliabilityProtocol = struct {
 | Memory footprint | ~200MB (JVM heap) | ~200MB | **<10 MB** (+ buffers) |
 
 ### 4.2 Benchmark Suite
+
+> **Status: mostly implemented** (`bench/` — ping-pong, throughput, UDP RTT,
+> SPSC/MPSC latency, codec, logbuffer, IPC multi-size, suite runner). The
+> **jitter** benchmark is planned, not yet implemented. Числа в 4.1 — targets,
+> не измеренные результаты.
 
 ```zig
 // Встроенный в проект benchmark framework
@@ -784,6 +854,12 @@ Exchange ──WS/FIX──▶ Gateway (Rust + ZigBolt FFI)
 
 ### 5.3 Rust/Python FFI
 
+> **Status: implemented**, но сигнатуры ниже — ранний драфт. Актуальный C ABI
+> см. `src/ffi/exports.zig`: `zigbolt_transport_create(term_length, use_hugepages,
+> pre_fault)`, `zigbolt_ipc_create/open/destroy`, `zigbolt_publish(handle, data,
+> len, msg_type_id)`, `zigbolt_poll(handle, callback, limit)`,
+> `zigbolt_version_major/minor/patch` (0.2.1).
+
 ```zig
 // C ABI export для Rust/Python интеграции
 export fn zigbolt_transport_create(config: *const TransportConfig) ?*Transport {
@@ -819,52 +895,52 @@ transport = lib.zigbolt_transport_create(config)
 
 ## Часть 6: Development Roadmap
 
-### Phase 1: Transport Core (2-3 месяца)
-- [ ] SPSC/MPSC Ring Buffers
-- [ ] Log Buffer (triple-buffered terms)
-- [ ] IPC Channel (shared memory)
-- [ ] Comptime Wire Codec
-- [ ] Basic Publisher/Subscriber API
-- [ ] Ping-pong benchmark
+### Phase 1: Transport Core (2-3 месяца) — DONE
+- [x] SPSC/MPSC Ring Buffers
+- [x] Log Buffer (triple-buffered terms)
+- [x] IPC Channel (shared memory)
+- [x] Comptime Wire Codec
+- [x] Basic Publisher/Subscriber API
+- [x] Ping-pong benchmark
 - **Target:** IPC RTT < 200 нс, beat Aeron open-source
 
-### Phase 2: Network Layer (2-3 месяца)
-- [ ] UDP unicast/multicast
+### Phase 2: Network Layer (2-3 месяца) — DONE кроме io_uring
+- [x] UDP unicast/multicast
 - [ ] io_uring backend
-- [ ] NAK-based reliability
-- [ ] Flow control
-- [ ] Fragmentation/reassembly
+- [x] NAK-based reliability
+- [x] Flow control
+- [x] Fragmentation/reassembly
 - **Target:** UDP RTT < 5 мкс (io_uring), throughput > 20M msg/sec
 
-### Phase 3: Archive (1-2 месяца)
-- [ ] Segment-based recording (io_uring writes)
-- [ ] Replay with position tracking
-- [ ] Compression (LZ4)
+### Phase 3: Archive (1-2 месяца) — частично
+- [x] Segment-based recording (POSIX I/O; io_uring writes — planned)
+- [x] Replay with position tracking
+- [x] Compression (LZ4-style; standalone module, не встроен в recording path)
 - [ ] Parquet export
 - [ ] QuestDB ILP streaming
 - **Target:** Record at line rate, replay без stalls
 
-### Phase 4: Cluster (2-3 месяца)
-- [ ] Raft leader election
-- [ ] Log replication
-- [ ] State Machine interface
-- [ ] Snapshot/restore
+### Phase 4: Cluster (2-3 месяца) — частично
+- [x] Raft leader election
+- [x] Log replication
+- [x] State Machine interface
+- [x] Snapshot/restore
 - [ ] Multi-Raft
 - **Target:** Committed entry latency < 100 мкс (same-rack)
 
-### Phase 5: Sequencer + Kernel Bypass (2-3 месяца)
-- [ ] Total ordering sequencer
+### Phase 5: Sequencer + Kernel Bypass (2-3 месяца) — частично
+- [x] Total ordering sequencer (in-process; Raft-replicated — planned)
 - [ ] DPDK backend
 - [ ] AF_XDP backend
-- [ ] Multi-stream sequencer
+- [x] Multi-stream sequencer
 - **Target:** Sequenced event latency < 50 мкс, DPDK RTT < 1 мкс
 
 ### Phase 6: Production Hardening (ongoing)
 - [ ] Fault injection testing
 - [ ] Chaos engineering framework
 - [ ] Monitoring/metrics (Prometheus compatible)
-- [ ] Documentation + examples
-- [ ] Rust/Python/C bindings
+- [x] Documentation + examples
+- [x] Rust/Python/C bindings (+ Go, TypeScript)
 - [ ] Package manager (Zig package + C shared library)
 
 ---
@@ -893,13 +969,16 @@ transport = lib.zigbolt_transport_create(config)
 | **ZeroMQ** | C | 1-5 мкс | TCP/IPC | Нет | LGPL |
 | **LMAX Disruptor** | Java | 50-100 нс | N/A (IPC only) | N/A | Apache 2.0 |
 | **DPDK** | C | N/A | UDP/raw | Да (native) | BSD |
-| **ZigBolt** | Zig | **<100 нс** | UDP/io_uring/DPDK | **Да (native)** | MIT |
+| **ZigBolt** | Zig | **<100 нс (target)** | UDP (io_uring/DPDK — planned) | **Planned** | MIT |
 
-**Уникальная позиция ZigBolt:** единственная система, которая комбинирует:
-1. Sub-100ns IPC (уровень LMAX Disruptor)
-2. Reliable UDP networking (уровень Aeron)
-3. Native kernel bypass (уровень DPDK)
-4. Comptime wire codecs (лучше SBE)
+> Строка ZigBolt — целевая позиция: latency-числа — targets, kernel bypass —
+> planned (см. Implementation Status).
+
+**Уникальная позиция ZigBolt (целевая):** система, которая комбинирует:
+1. Sub-100ns IPC (уровень LMAX Disruptor) — target
+2. Reliable UDP networking (уровень Aeron) — implemented
+3. Native kernel bypass (уровень DPDK) — planned
+4. Comptime wire codecs (лучше SBE) — implemented
 5. Нет JVM/GC overhead
 6. Cluster/Sequencer для HA
 7. Всё это в одном unified package

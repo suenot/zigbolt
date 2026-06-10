@@ -82,7 +82,7 @@ runtime overhead.
 
 ### Requirements
 
-- **Zig 0.15.1** (or compatible)
+- **Zig 0.15.1+** (minimum 0.15.0, per `build.zig.zon`)
 - **macOS** (ARM64 / x86_64) or **Linux** (x86_64, aarch64)
 
 ### Build
@@ -96,6 +96,8 @@ zig build
 ```bash
 zig build test
 ```
+
+Runs the full unit test suite (423 tests, including the FFI surface).
 
 ### Run Benchmarks
 
@@ -181,7 +183,9 @@ defer sub_ch.deinit();
 var subscriber = zigbolt.Subscriber(TickMessage).init(&sub_ch, 1);
 _ = subscriber.poll(&handleTick, 100);
 
-fn handleTick(msg: *const TickMessage) void {
+// The decoded pointer aliases the shared-memory frame (zero-copy),
+// so the handler takes `*align(1) const T`.
+fn handleTick(msg: *align(1) const TickMessage) void {
     // Zero-copy: msg points directly into shared memory
     _ = msg.price;
 }
@@ -360,7 +364,7 @@ lib.zigbolt_ipc_destroy(ch)
 | `zigbolt_ipc_destroy` | Close and destroy an IPC channel |
 | `zigbolt_publish` | Publish a message (returns 0 on success) |
 | `zigbolt_poll` | Poll for messages with a callback |
-| `zigbolt_version_major/minor/patch` | Library version (0.1.0) |
+| `zigbolt_version_major/minor/patch` | Library version (0.2.1) |
 
 ## Project Structure
 
@@ -416,15 +420,19 @@ zigbolt/
     ffi/
       exports.zig        # C-ABI function exports
   bench/
-    ping_pong.zig        # IPC RTT benchmark
-    throughput.zig       # IPC throughput benchmark
-    udp_rtt.zig          # UDP RTT benchmark
-    hdr_histogram.zig    # HDR histogram for latency measurement
-  docs/
-    architecture.md      # Architecture deep-dive
-    api-reference.md     # Full API reference
-    benchmarks.md        # Benchmark methodology and results
-    examples.md          # Usage examples
+    ping_pong.zig             # IPC RTT benchmark
+    throughput.zig            # IPC throughput benchmark
+    udp_rtt.zig               # UDP RTT benchmark
+    spsc_latency.zig          # SPSC ring buffer latency benchmark
+    mpsc_latency.zig          # MPSC ring buffer latency benchmark
+    codec_throughput.zig      # WireCodec encode/decode benchmark
+    ipc_multisize.zig         # IPC latency across message sizes
+    logbuffer_throughput.zig  # LogBuffer claim/commit/read benchmark
+    run_all.zig               # Full suite runner (writes bench/results.json)
+    hdr_histogram.zig         # HDR histogram for latency measurement
+  frontend/              # Astro Starlight documentation site
+    src/content/docs/    # Docs source (getting-started, architecture,
+                         #   reference, examples, performance, changelog)
 ```
 
 ## License

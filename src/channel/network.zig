@@ -100,10 +100,18 @@ pub const NetworkChannel = struct {
         // fits the 64 KB datagram buffer and the per-fragment payload
         // budget stays positive.
         const effective_mtu = std.math.clamp(net_config.mtu, 128, 65504);
+        // Acquire the fallible resources before building the struct: a
+        // failure in a later step must release the earlier ones (the
+        // struct-literal form leaked the socket and the send buffer).
+        var udp_ch = try UdpChannel.init(net_config.udp);
+        errdefer udp_ch.deinit();
+        var send_buf = try reliability.SendBuffer.init(allocator, net_config.send_buffer_capacity);
+        errdefer send_buf.deinit(allocator);
+        const recv_tracker = try reliability.RecvTracker.init(allocator, net_config.recv_window_size);
         return .{
-            .udp = try UdpChannel.init(net_config.udp),
-            .send_buf = try reliability.SendBuffer.init(allocator, net_config.send_buffer_capacity),
-            .recv_tracker = try reliability.RecvTracker.init(allocator, net_config.recv_window_size),
+            .udp = udp_ch,
+            .send_buf = send_buf,
+            .recv_tracker = recv_tracker,
             .flow_control = reliability.FlowControl.init(net_config.flow_control_window),
             .fragmenter = frag.Fragmenter.init(.{
                 .mtu = effective_mtu,
@@ -607,6 +615,40 @@ fn pollUntilDelivered(ch: *NetworkChannel, want: u32) !void {
     }
 }
 
+// Delayed wire actions: fired from a second thread after a short delay so
+// the test's poll/recv retry loop actually spins (and sleeps) at least once
+// before the datagram lands.
+const Delayed = struct {
+    const delay_ns: u64 = 2_000_000; // 2 ms
+
+    fn sendUnknownTypeThenValid(att: *UdpChannel, addr: net.Address) void {
+        std.Thread.sleep(delay_ns);
+        var hostile_buf: [128]u8 = undefined;
+        const hostile = buildDataPacket(&hostile_buf, 0, "boom!");
+        hostile_buf[@offsetOf(reliability.NetworkHeader, "header_type")] = 200;
+        _ = att.send(hostile, addr) catch {};
+        var valid_buf: [128]u8 = undefined;
+        _ = att.send(buildDataPacket(&valid_buf, 0, "ok"), addr) catch {};
+    }
+
+    fn sendNak(att: *UdpChannel, addr: net.Address, from: u64, count: u32) void {
+        std.Thread.sleep(delay_ns);
+        var b: [128]u8 = undefined;
+        _ = att.send(buildNakPacket(&b, 1, 1, from, count), addr) catch {};
+    }
+
+    fn sendHeartbeat(att: *UdpChannel, addr: net.Address, ack: u64) void {
+        std.Thread.sleep(delay_ns);
+        var b: [64]u8 = undefined;
+        _ = att.send(buildHeartbeatPacket(&b, ack), addr) catch {};
+    }
+
+    fn publish(ch: *NetworkChannel, data: []const u8) void {
+        std.Thread.sleep(delay_ns);
+        ch.publish(data, 1) catch {};
+    }
+};
+
 test "NetworkChannel init and deinit" {
     const allocator = std.testing.allocator;
     const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
@@ -706,18 +748,12 @@ test "NetworkChannel drops unknown header type instead of panicking" {
 
     // Datagram with a wire header_type byte of 200 (valid enum tags are
     // 0..4). Before the fix, poll() panicked with "switch on corrupt
-    // value" — a guaranteed remote-crash DoS in Debug builds.
-    var hostile_buf: [128]u8 = undefined;
-    const hostile = buildDataPacket(&hostile_buf, 0, "boom!");
-    hostile_buf[@offsetOf(reliability.NetworkHeader, "header_type")] = 200;
-    _ = try attacker.send(hostile, ch_addr);
-
-    // A valid datagram behind it must still be delivered.
-    var valid_buf: [128]u8 = undefined;
-    const valid = buildDataPacket(&valid_buf, 0, "ok");
-    _ = try attacker.send(valid, ch_addr);
-
+    // value" — a guaranteed remote-crash DoS in Debug builds. A valid
+    // datagram behind it must still be delivered. Both are sent from a
+    // delayed thread so the poll loop actually retries first.
+    const sender = try std.Thread.spawn(.{}, Delayed.sendUnknownTypeThenValid, .{ &attacker, ch_addr });
     try pollUntilDelivered(&ch, 1);
+    sender.join();
     try std.testing.expectEqual(@as(u32, 1), g_delivered_count);
     try std.testing.expectEqual(@as(usize, 2), g_delivered_bytes); // "ok" only
 }
@@ -753,8 +789,8 @@ test "NetworkChannel survives NAK with from_sequence near u64 max and checks inn
     var b2: [128]u8 = undefined;
     _ = try attacker.send(buildNakPacket(&b2, 99, 1, 0, 1), ch_addr);
     // 3) Valid NAK with a huge count: capped, retransmits both messages.
-    var b3: [128]u8 = undefined;
-    _ = try attacker.send(buildNakPacket(&b3, 1, 1, 0, std.math.maxInt(u32)), ch_addr);
+    //    Sent delayed so the poll loop below has to spin first.
+    const sender = try std.Thread.spawn(.{}, Delayed.sendNak, .{ &attacker, ch_addr, @as(u64, 0), std.math.maxInt(u32) });
 
     // Poll until the valid NAK (sent last, FIFO on loopback) is processed.
     for (0..200) |_| {
@@ -764,6 +800,7 @@ test "NetworkChannel survives NAK with from_sequence near u64 max and checks inn
         }
         std.Thread.sleep(100_000);
     }
+    sender.join();
 
     // Exactly one retransmission each: the mismatched-inner-id NAK (which
     // also targeted sequence 0) must NOT have triggered a retransmit.
@@ -887,9 +924,9 @@ test "NetworkChannel flow control replenishes via heartbeat acks" {
         try std.testing.expectError(error.BackPressured, ch.publish(&msg, 1));
         try std.testing.expectEqual(@as(i64, 0), ch.flow_control.available());
 
-        // Receiver acks everything sent so far via heartbeat.
-        var hb_buf: [64]u8 = undefined;
-        _ = try receiver.send(buildHeartbeatPacket(&hb_buf, ch.next_sequence), ch_addr);
+        // Receiver acks everything sent so far via heartbeat (delayed, so
+        // the credit-wait loop below actually retries).
+        const hb = try std.Thread.spawn(.{}, Delayed.sendHeartbeat, .{ &receiver, ch_addr, ch.next_sequence });
 
         // Poll until the heartbeat is processed and credits return.
         for (0..200) |_| {
@@ -897,6 +934,7 @@ test "NetworkChannel flow control replenishes via heartbeat acks" {
             if (ch.flow_control.available() >= window) break;
             std.Thread.sleep(100_000);
         }
+        hb.join();
         try std.testing.expectEqual(window, ch.flow_control.available());
     }
 
@@ -984,14 +1022,15 @@ test "NetworkChannel round-trips a fragmented message exactly once" {
         b.* = @intCast((i * 31 + 7) % 256);
     }
 
-    try tx.publish(&msg, 1);
-    try std.testing.expectEqual(@as(u64, 7), tx.next_sequence);
-
+    // Published from a delayed thread so the rx poll loop spins first.
+    const pub_big = try std.Thread.spawn(.{}, Delayed.publish, .{ &tx, @as([]const u8, &msg) });
     for (0..200) |_| {
         _ = try rx.poll(testCaptureHandler, 16);
         if (g_capture_calls >= 1) break;
         std.Thread.sleep(100_000); // 100 μs
     }
+    pub_big.join();
+    try std.testing.expectEqual(@as(u64, 7), tx.next_sequence);
 
     // Delivered exactly once, complete and byte-exact.
     try std.testing.expectEqual(@as(u32, 1), g_capture_calls);
@@ -1006,12 +1045,13 @@ test "NetworkChannel round-trips a fragmented message exactly once" {
 
     // Small messages still ride the unfragmented fast path on the same
     // stream, after the fragmented one.
-    try tx.publish("tiny", 1);
+    const pub_tiny = try std.Thread.spawn(.{}, Delayed.publish, .{ &tx, @as([]const u8, "tiny") });
     for (0..200) |_| {
         _ = try rx.poll(testCaptureHandler, 16);
         if (g_capture_calls >= 2) break;
         std.Thread.sleep(100_000);
     }
+    pub_tiny.join();
     try std.testing.expectEqual(@as(u32, 2), g_capture_calls);
     try std.testing.expectEqual(@as(usize, 4), g_capture_len);
     try std.testing.expectEqualSlices(u8, "tiny", g_capture_buf[0..4]);
@@ -1073,13 +1113,13 @@ test "NetworkChannel retransmits fragments with the fragment marking intact" {
     defer ch.deinit();
     const ch_addr = try boundAddress(ch.udp.socket_fd);
 
-    // 3000 bytes => 3 fragments (1456 + 1456 + 88), sequences 0..2.
+    // 3000 bytes => 3 fragments (1456 + 1456 + 88), sequences 0..2 —
+    // published after a delay so the drain loop below retries first.
     var msg: [3000]u8 = undefined;
     for (&msg, 0..) |*b, i| {
         b.* = @intCast((i * 13 + 5) % 256);
     }
-    try ch.publish(&msg, 1);
-    try std.testing.expectEqual(@as(u64, 3), ch.next_sequence);
+    const publisher = try std.Thread.spawn(.{}, Delayed.publish, .{ &ch, @as([]const u8, &msg) });
 
     // Drain the three original fragment datagrams; keep the first (seq 0).
     var first_dg: [4096]u8 = undefined;
@@ -1098,41 +1138,43 @@ test "NetworkChannel retransmits fragments with the fragment marking intact" {
             std.Thread.sleep(100_000);
         }
     }
+    publisher.join();
+    try std.testing.expectEqual(@as(u64, 3), ch.next_sequence);
     try std.testing.expectEqual(@as(u32, 3), got);
     // Original datagram is marked as a fragment.
     try std.testing.expect(first_dg[@offsetOf(reliability.NetworkHeader, "_reserved")] & FRAGMENT_FLAG != 0);
 
-    // NAK sequence 0: the channel must retransmit it byte-identically —
-    // including the fragment marking. Without it, the receiver would
-    // deliver the raw FragmentHeader + fragment bytes as a message.
-    var nak_buf: [128]u8 = undefined;
-    _ = try receiver.send(buildNakPacket(&nak_buf, 1, 1, 0, 1), ch_addr);
+    // One poll before the NAK: it emits a heartbeat to the receiver, which
+    // the wait loop below must skip over.
+    _ = try ch.poll(testNoopHandler, 16);
 
-    for (0..200) |_| {
+    // NAK sequence 0 (sent delayed): the channel must retransmit it
+    // byte-identically — including the fragment marking. Without it, the
+    // receiver would deliver the raw FragmentHeader + fragment bytes as a
+    // message.
+    const nakker = try std.Thread.spawn(.{}, Delayed.sendNak, .{ &receiver, ch_addr, @as(u64, 0), @as(u32, 1) });
+
+    // Drive ch.poll while waiting: skip the heartbeat datagram, sleep while
+    // the delayed NAK is still in flight, stop on the retransmitted DATA.
+    var rt_buf: [4096]u8 = undefined;
+    var retransmitted_len: usize = 0;
+    for (0..400) |_| {
         _ = try ch.poll(testNoopHandler, 16);
-        if (ch.send_buf.get(0)) |e| {
-            if (e.retransmit_count > 0) break;
-        }
-        std.Thread.sleep(100_000);
-    }
-    try std.testing.expectEqual(@as(u8, 1), ch.send_buf.get(0).?.retransmit_count);
-
-    // ch.poll() also emits heartbeats to the receiver — skip any non-data
-    // datagram while waiting for the retransmission.
-    var retransmitted: ?UdpChannel.RecvResult = null;
-    for (0..200) |_| {
         if (try receiver.recv(&buf)) |r| {
             const type_byte = r.data[@offsetOf(reliability.NetworkHeader, "header_type")];
-            if (type_byte == @intFromEnum(reliability.NetworkHeader.HeaderType.data)) {
-                retransmitted = r;
-                break;
+            if (type_byte != @intFromEnum(reliability.NetworkHeader.HeaderType.data)) {
+                continue;
             }
-            continue;
+            @memcpy(rt_buf[0..r.data.len], r.data);
+            retransmitted_len = r.data.len;
+            break;
         }
         std.Thread.sleep(100_000);
     }
-    try std.testing.expect(retransmitted != null);
-    const rt = retransmitted.?.data;
+    nakker.join();
+    try std.testing.expectEqual(@as(u8, 1), ch.send_buf.get(0).?.retransmit_count);
+    try std.testing.expect(retransmitted_len != 0);
+    const rt = rt_buf[0..retransmitted_len];
     try std.testing.expectEqual(first_len, rt.len);
     // Compare the defined header fields and the payload; the extern
     // struct's padding bytes (offsets 2..4, 12..16, 31) are undefined and
@@ -1146,4 +1188,189 @@ test "NetworkChannel retransmits fragments with the fragment marking intact" {
         first_dg[reliability.NetworkHeader.SIZE..first_len],
         rt[reliability.NetworkHeader.SIZE..],
     );
+}
+
+test "NetworkChannel init releases scratch buffers when the bind fails" {
+    // 192.0.2.1 (TEST-NET-1, RFC 5737) is never assigned locally: the UDP
+    // bind fails after missing_buf/frag_sent were allocated, so their
+    // errdefers must free them (the testing allocator checks for leaks).
+    const result = NetworkChannel.init(std.testing.allocator, .{
+        .udp = .{
+            .bind_address = net.Address.initIp4(.{ 192, 0, 2, 1 }, 0),
+            .non_blocking = true,
+        },
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+    });
+    try std.testing.expect(std.meta.isError(result));
+}
+
+test "NetworkChannel init survives allocation failure at every point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var ch = try NetworkChannel.init(allocator, .{
+                .udp = .{
+                    .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+                    .non_blocking = true,
+                },
+                .send_buffer_capacity = 16,
+                .recv_window_size = 16,
+            });
+            ch.deinit();
+        }
+    }.run, .{});
+}
+
+test "NetworkChannel NAKs the first contiguous gap and resets when it is filled" {
+    const allocator = std.testing.allocator;
+
+    // Raw peer socket: injects DATA datagrams with gaps and receives the
+    // channel's NAKs (it is the configured remote).
+    var peer = try UdpChannel.init(.{
+        .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+        .non_blocking = true,
+    });
+    defer peer.deinit();
+    const peer_addr = try boundAddress(peer.socket_fd);
+
+    var ch = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+            .non_blocking = true,
+            .remote_address = peer_addr,
+        },
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+    });
+    defer ch.deinit();
+    const ch_addr = try boundAddress(ch.udp.socket_fd);
+
+    // Sequences 0, 3 and 5 arrive: 1, 2 and 4 are missing.
+    var b: [128]u8 = undefined;
+    _ = try peer.send(buildDataPacket(&b, 0, "s0"), ch_addr);
+    _ = try peer.send(buildDataPacket(&b, 3, "s3"), ch_addr);
+    _ = try peer.send(buildDataPacket(&b, 5, "s5"), ch_addr);
+
+    for (0..200) |_| {
+        _ = try ch.poll(testNoopHandler, 16);
+        if (ch.recv_tracker.next_expected == 6) break;
+        std.Thread.sleep(100_000);
+    }
+    try std.testing.expectEqual(@as(u64, 6), ch.recv_tracker.next_expected);
+    // The NAK backoff tracks the leading gap.
+    try std.testing.expectEqual(@as(?u64, 1), ch.current_gap_from);
+
+    // The peer must receive a NAK for the FIRST contiguous gap only:
+    // from_sequence 1, count 2 (sequence 4 is a separate gap).
+    var rbuf: [512]u8 = undefined;
+    var nak: ?reliability.NakMessage = null;
+    for (0..200) |_| {
+        _ = try ch.poll(testNoopHandler, 16);
+        if (try peer.recv(&rbuf)) |r| {
+            const type_byte = r.data[@offsetOf(reliability.NetworkHeader, "header_type")];
+            if (type_byte == @intFromEnum(reliability.NetworkHeader.HeaderType.nak) and
+                r.data.len >= reliability.NetworkHeader.SIZE + @sizeOf(reliability.NakMessage))
+            {
+                var nak_copy: reliability.NakMessage = undefined;
+                @memcpy(
+                    std.mem.asBytes(&nak_copy),
+                    r.data[reliability.NetworkHeader.SIZE..][0..@sizeOf(reliability.NakMessage)],
+                );
+                nak = nak_copy;
+                break;
+            }
+            continue; // heartbeat — keep waiting
+        }
+        std.Thread.sleep(100_000);
+    }
+    try std.testing.expect(nak != null);
+    try std.testing.expectEqual(@as(u32, 1), nak.?.session_id);
+    try std.testing.expectEqual(@as(u32, 1), nak.?.stream_id);
+    try std.testing.expectEqual(@as(u64, 1), nak.?.from_sequence);
+    try std.testing.expectEqual(@as(u32, 2), nak.?.count);
+
+    // Retransmissions fill every gap: the NAK state must reset.
+    _ = try peer.send(buildDataPacket(&b, 1, "s1"), ch_addr);
+    _ = try peer.send(buildDataPacket(&b, 2, "s2"), ch_addr);
+    _ = try peer.send(buildDataPacket(&b, 4, "s4"), ch_addr);
+
+    var missing_scratch: [8]u64 = undefined;
+    for (0..200) |_| {
+        _ = try ch.poll(testNoopHandler, 16);
+        if (ch.current_gap_from == null and
+            ch.recv_tracker.getMissingInto(&missing_scratch) == 0) break;
+        std.Thread.sleep(100_000);
+    }
+    try std.testing.expectEqual(@as(?u64, null), ch.current_gap_from);
+    try std.testing.expectEqual(@as(usize, 0), ch.recv_tracker.getMissingInto(&missing_scratch));
+}
+
+test "publish restores flow-control credits when the retransmit store fails" {
+    // Walk the allocation-failure index forward until init succeeds with a
+    // budget of exactly zero further allocations: the next one — the send
+    // buffer's payload copy inside publish — then fails, and the consumed
+    // credits must be returned.
+    var fail_index: usize = 0;
+    var verified = false;
+    while (fail_index < 64 and !verified) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var ch = NetworkChannel.init(failing.allocator(), .{
+            .udp = .{
+                .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+                .non_blocking = true,
+                .remote_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 9999),
+            },
+            .send_buffer_capacity = 64,
+            .recv_window_size = 64,
+        }) catch continue;
+        defer ch.deinit();
+
+        const before = ch.flow_control.available();
+        try std.testing.expectError(error.OutOfMemory, ch.publish("credit check", 1));
+        try std.testing.expectEqual(before, ch.flow_control.available());
+        verified = true;
+    }
+    try std.testing.expect(verified);
+}
+
+test "poll surfaces a hard transport error from recv" {
+    const allocator = std.testing.allocator;
+
+    var ch = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+            .non_blocking = true,
+        },
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+    });
+    defer ch.deinit();
+
+    // A loopback port with nothing behind it: bind a probe socket, note
+    // its ephemeral port, close it.
+    var probe = try UdpChannel.init(.{
+        .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+        .non_blocking = true,
+    });
+    const dead_addr = try boundAddress(probe.socket_fd);
+    probe.deinit();
+
+    // Connect the channel's socket to the dead port: the ICMP
+    // port-unreachable elicited by the datagram below then surfaces as
+    // ConnectionRefused on a later recv, which poll must propagate
+    // (everything except WouldBlock is a hard error).
+    try posix.connect(ch.udp.socket_fd, &dead_addr.any, dead_addr.getOsSockLen());
+    _ = posix.send(ch.udp.socket_fd, "ping", 0) catch {};
+
+    var got_error = false;
+    for (0..200) |_| {
+        if (ch.poll(testNoopHandler, 16)) |_| {
+            std.Thread.sleep(100_000);
+        } else |err| {
+            try std.testing.expectEqual(error.ConnectionRefused, err);
+            got_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(got_error);
 }

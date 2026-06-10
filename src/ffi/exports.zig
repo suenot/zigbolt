@@ -95,13 +95,13 @@ pub export fn zigbolt_poll(handle: ?*anyopaque, callback: ?FragmentHandlerFn, li
 // ── Version Info ─────────────────────────────────────────────
 
 pub export fn zigbolt_version_major() u32 {
-    return 0;
+    return zigbolt.version_major;
 }
 
 pub export fn zigbolt_version_minor() u32 {
-    return 1;
+    return zigbolt.version_minor;
 }
 
 pub export fn zigbolt_version_patch() u32 {
-    return 0;
+    return zigbolt.version_patch;
 }

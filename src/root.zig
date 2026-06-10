@@ -169,7 +169,7 @@ pub const version_patch: u32 = 1;
 
 // ── Tests ────────────────────────────────────────────────────
 test {
-    @import("std").testing.refAllDecls(@This());
+    @import("std").testing.refAllDeclsRecursive(@This());
 }
 
 test "version constants" {

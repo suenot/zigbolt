@@ -229,13 +229,13 @@ pub const Reassembler = struct {
         const now = config.timestampNs();
 
         // Collect keys to remove (cannot modify map while iterating)
-        var keys_to_remove = std.ArrayList(u64).init(self.allocator);
-        defer keys_to_remove.deinit();
+        var keys_to_remove: std.ArrayList(u64) = .empty;
+        defer keys_to_remove.deinit(self.allocator);
 
         var it = self.pending.iterator();
         while (it.next()) |entry| {
             if (now -| entry.value_ptr.timestamp_ns > max_age_ns) {
-                keys_to_remove.append(entry.key_ptr.*) catch continue;
+                keys_to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 

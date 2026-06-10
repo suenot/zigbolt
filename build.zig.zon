@@ -1,6 +1,6 @@
 .{
     .name = .zigbolt,
-    .version = "0.1.0",
+    .version = "0.2.1",
     .fingerprint = 0x9d1987cf34d57142,
     .minimum_zig_version = "0.15.0",
     .paths = .{

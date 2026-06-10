@@ -11,6 +11,29 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── FFI Library (C ABI, shared + static) ────────────────
+    const ffi_mod = b.createModule(.{
+        .root_source_file = b.path("src/ffi/exports.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ffi_mod.addImport("zigbolt", lib_mod);
+
+    const shared_lib = b.addLibrary(.{
+        .name = "zigbolt",
+        .linkage = .dynamic,
+        .root_module = ffi_mod,
+    });
+    b.installArtifact(shared_lib);
+
+    const static_lib = b.addLibrary(.{
+        .name = "zigbolt",
+        .linkage = .static,
+        .root_module = ffi_mod,
+    });
+    b.installArtifact(static_lib);
+
     // ── Tests ────────────────────────────────────────────────
     // Run all tests via root.zig which uses refAllDecls to discover them.
     const test_step = b.step("test", "Run all unit tests");

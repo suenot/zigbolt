@@ -9,3 +9,4 @@ zig-out/
 test_mmap*
 test_shm*
 test_io*
+coverage/

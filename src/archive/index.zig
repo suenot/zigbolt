@@ -1,4 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Fsync a directory handle so a completed rename in it is durable.
+fn syncDir(dir: std.fs.Dir) !void {
+    if (builtin.os.tag == .windows) return;
+    try std.posix.fsync(dir.fd);
+}
 
 /// A single entry in the sparse index, pointing to a record's location.
 pub const IndexEntry = struct {
@@ -16,10 +23,13 @@ pub const IndexEntry = struct {
     pub const SERIALIZED_SIZE: usize = 24;
 };
 
-/// Record header constants (must match segment.zig).
+/// Record header constants (must match segment.zig):
+/// [u32 length][u32 crc][u64 timestamp_ns][u32 stream_id][i32 msg_type_id][payload]
 const length_prefix_size: u32 = @sizeOf(u32);
+const crc_size: u32 = @sizeOf(u32);
 const record_header_size: u32 = @sizeOf(u64) + @sizeOf(u32) + @sizeOf(i32); // 16
-const full_header_size: u32 = length_prefix_size + record_header_size; // 20
+const record_overhead: u32 = crc_size + record_header_size; // 20
+const full_header_size: u32 = length_prefix_size + crc_size + record_header_size; // 24
 
 /// Magic bytes for index file: "ZBIX" (ZigBolt IndeX).
 const INDEX_MAGIC: u32 = 0x5A424958;
@@ -67,9 +77,15 @@ pub const SparseIndex = struct {
         self.records_seen += 1;
     }
 
-    /// Find the nearest index entry at or before the given timestamp using binary search.
-    /// Returns the entry with the largest timestamp_ns <= the query timestamp,
-    /// or null if no such entry exists.
+    /// Find a SCAN-START HINT for the given timestamp using binary search.
+    ///
+    /// Contract: returns the entry with the largest timestamp_ns <= the query
+    /// when one exists. If ALL indexed entries are after the query, the FIRST
+    /// entry is returned as the scan-start hint (for an index built from
+    /// record 0 this is the start of the segment, which is the correct place
+    /// to begin a forward scan). Returns null only for an empty index.
+    /// Callers needing an exact "at or before" match must compare the
+    /// returned entry's timestamp_ns against the query themselves.
     pub fn findByTimestamp(self: *const SparseIndex, timestamp_ns: u64) ?IndexEntry {
         const items = self.entries.items;
         if (items.len == 0) return null;
@@ -94,7 +110,10 @@ pub const SparseIndex = struct {
         return items[lo - 1];
     }
 
-    /// Find the nearest index entry at or before the given record sequence.
+    /// Find a SCAN-START HINT for the given record sequence.
+    /// Same contract as `findByTimestamp`: largest record_seq <= query when
+    /// one exists, otherwise the first entry as a scan-start hint; null only
+    /// for an empty index.
     pub fn findBySequence(self: *const SparseIndex, record_seq: u32) ?IndexEntry {
         const items = self.entries.items;
         if (items.len == 0) return null;
@@ -118,38 +137,66 @@ pub const SparseIndex = struct {
 
     /// Save index to disk alongside segment file.
     /// File name: <base_path>/segment_NNNNNNNNNN.idx
+    ///
+    /// Crash-safe atomic write (same recipe as the cluster snapshot/WAL):
+    /// write `<name>.tmp`, fsync it, rename over the final name, fsync the
+    /// directory. A crash mid-save leaves either the old index or the new
+    /// one — never a torn file.
     pub fn save(self: *const SparseIndex, base_path: []const u8) !void {
-        var path_buf: [300]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "{s}/segment_{d:0>10}.idx", .{ base_path, self.segment_id }) catch
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "segment_{d:0>10}.idx", .{self.segment_id}) catch
             return error.PathTooLong;
+        var tmp_name_buf: [64]u8 = undefined;
+        const tmp_name = std.fmt.bufPrint(&tmp_name_buf, "segment_{d:0>10}.idx.tmp", .{self.segment_id}) catch
+            return error.PathTooLong;
+
+        if (self.entries.items.len > std.math.maxInt(u32)) {
+            return error.TooManyEntries;
+        }
 
         // Ensure parent directory exists.
         std.fs.cwd().makePath(base_path) catch {};
+        var dir = try std.fs.cwd().openDir(base_path, .{});
+        defer dir.close();
 
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        defer file.close();
+        // On any failure below, remove the temp file so it cannot linger.
+        errdefer dir.deleteFile(tmp_name) catch {};
 
-        // Write header.
-        var header: [INDEX_HEADER_SIZE]u8 = undefined;
-        std.mem.writeInt(u32, header[0..4], INDEX_MAGIC, .little);
-        std.mem.writeInt(u16, header[4..6], INDEX_VERSION, .little);
-        std.mem.writeInt(u16, header[6..8], 0, .little); // reserved
-        std.mem.writeInt(u32, header[8..12], self.segment_id, .little);
-        std.mem.writeInt(u32, header[12..16], self.interval, .little);
-        try file.writeAll(&header);
+        // 1. Write the temp file and fsync it before rename.
+        {
+            const file = try dir.createFile(tmp_name, .{ .truncate = true });
+            defer file.close();
 
-        // Write entry count as u32.
-        var count_buf: [4]u8 = undefined;
-        const entry_count: u32 = @intCast(self.entries.items.len);
-        std.mem.writeInt(u32, &count_buf, entry_count, .little);
-        try file.writeAll(&count_buf);
+            // Write header.
+            var header: [INDEX_HEADER_SIZE]u8 = undefined;
+            std.mem.writeInt(u32, header[0..4], INDEX_MAGIC, .little);
+            std.mem.writeInt(u16, header[4..6], INDEX_VERSION, .little);
+            std.mem.writeInt(u16, header[6..8], 0, .little); // reserved
+            std.mem.writeInt(u32, header[8..12], self.segment_id, .little);
+            std.mem.writeInt(u32, header[12..16], self.interval, .little);
+            try file.writeAll(&header);
 
-        // Write entries.
-        var buf: [IndexEntry.SERIALIZED_SIZE]u8 = undefined;
-        for (self.entries.items) |entry| {
-            serializeIndexEntry(entry, &buf);
-            try file.writeAll(&buf);
+            // Write entry count as u32.
+            var count_buf: [4]u8 = undefined;
+            const entry_count: u32 = @intCast(self.entries.items.len);
+            std.mem.writeInt(u32, &count_buf, entry_count, .little);
+            try file.writeAll(&count_buf);
+
+            // Write entries.
+            var buf: [IndexEntry.SERIALIZED_SIZE]u8 = undefined;
+            for (self.entries.items) |entry| {
+                serializeIndexEntry(entry, &buf);
+                try file.writeAll(&buf);
+            }
+
+            try file.sync();
         }
+
+        // 2. Atomically replace any previous index file.
+        try dir.rename(tmp_name, name);
+
+        // 3. Make the rename itself durable.
+        try syncDir(dir);
     }
 
     /// Load index from disk.
@@ -180,6 +227,14 @@ pub const SparseIndex = struct {
         const cnt_read = try file.readAll(&count_buf);
         if (cnt_read < 4) return error.CorruptIndex;
         const entry_count = std.mem.readInt(u32, &count_buf, .little);
+
+        // Cap entry_count against the actual file size BEFORE allocating:
+        // a corrupt count of 0xFFFFFFFF would otherwise drive
+        // ensureTotalCapacity to a ~96 GB allocation.
+        const file_size = try file.getEndPos();
+        const data_bytes = file_size -| (INDEX_HEADER_SIZE + 4);
+        const max_entries = data_bytes / IndexEntry.SERIALIZED_SIZE;
+        if (entry_count > max_entries) return error.CorruptIndex;
 
         // Read entries.
         var entries = std.ArrayListUnmanaged(IndexEntry){};
@@ -224,15 +279,17 @@ pub const SparseIndex = struct {
             if (len_read < 4) break;
 
             const total_record_len = std.mem.readInt(u32, &len_buf, .little);
-            if (total_record_len < record_header_size) break;
+            if (total_record_len < record_overhead) break;
+            // Record running past EOF => torn tail; stop indexing here.
+            if (offset + @as(u64, length_prefix_size) + @as(u64, total_record_len) > file_size) break;
 
-            // Read timestamp and stream_id from record header.
-            var hdr_buf: [record_header_size]u8 = undefined;
+            // Read crc + timestamp + stream_id from record header.
+            var hdr_buf: [record_overhead]u8 = undefined;
             const hdr_read = try segment_file.readAll(&hdr_buf);
-            if (hdr_read < record_header_size) break;
+            if (hdr_read < record_overhead) break;
 
-            const timestamp_ns = std.mem.readInt(u64, hdr_buf[0..8], .little);
-            const stream_id = std.mem.readInt(u32, hdr_buf[8..12], .little);
+            const timestamp_ns = std.mem.readInt(u64, hdr_buf[4..12], .little);
+            const stream_id = std.mem.readInt(u32, hdr_buf[12..16], .little);
 
             try idx.record(seq, offset, timestamp_ns, stream_id);
 
@@ -382,4 +439,55 @@ test "Empty index queries return null" {
 
     try std.testing.expect(idx.findByTimestamp(100) == null);
     try std.testing.expect(idx.findBySequence(0) == null);
+}
+
+test "SparseIndex save is atomic: no temp file left, repeated saves survive reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    {
+        var idx = SparseIndex.init(std.testing.allocator, 3, 1);
+        defer idx.deinit();
+        try idx.record(0, 0, 111, 1);
+        try idx.save(base);
+
+        // Save again with more entries — overwrites via rename, never truncate-in-place.
+        try idx.record(1, 40, 222, 1);
+        try idx.save(base);
+    }
+
+    // No stale .tmp file may remain after a successful save.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("segment_0000000003.idx.tmp", .{}));
+
+    var loaded = try SparseIndex.load(std.testing.allocator, base, 3);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 222), loaded.entries.items[1].timestamp_ns);
+}
+
+test "SparseIndex load rejects corrupt entry_count without huge allocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    {
+        var idx = SparseIndex.init(std.testing.allocator, 9, 1);
+        defer idx.deinit();
+        try idx.record(0, 0, 100, 1);
+        try idx.save(base);
+    }
+
+    // Corrupt the entry count field (4 bytes after the 16-byte header) to
+    // 0xFFFFFFFF: would have driven ensureTotalCapacity to a ~96 GB alloc.
+    {
+        const f = try tmp.dir.openFile("segment_0000000009.idx", .{ .mode = .read_write });
+        defer f.close();
+        try f.seekTo(INDEX_HEADER_SIZE);
+        try f.writeAll(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+    }
+
+    try std.testing.expectError(error.CorruptIndex, SparseIndex.load(std.testing.allocator, base, 9));
 }

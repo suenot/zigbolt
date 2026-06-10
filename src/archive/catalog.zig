@@ -1,8 +1,17 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Magic bytes "ZBCT" (ZigBolt CaTalog) as little-endian u32.
 const CATALOG_MAGIC: u32 = 0x5A424354;
-const CATALOG_VERSION: u16 = 1;
+/// Version 2: entry_count widened u16 -> u32 (a u16 count silently
+/// truncated/panicked beyond 65535 segments) and a reserved padding field.
+const CATALOG_VERSION: u16 = 2;
+
+/// Fsync a directory handle so a completed rename in it is durable.
+fn syncDir(dir: std.fs.Dir) !void {
+    if (builtin.os.tag == .windows) return;
+    try std.posix.fsync(dir.fd);
+}
 
 /// Metadata entry describing a single segment in the archive.
 pub const CatalogEntry = struct {
@@ -15,7 +24,10 @@ pub const CatalogEntry = struct {
     start_timestamp_ns: u64,
     /// Timestamp of last record.
     end_timestamp_ns: u64,
-    /// Primary stream_id (or 0 for mixed).
+    /// Primary stream_id. NOTE: 0 is a RESERVED sentinel meaning "mixed
+    /// streams" — a mixed entry matches every findByStream query. Real stream
+    /// ids written by producers must therefore start at 1; using 0 as a legal
+    /// stream id would make its segments match every query.
     stream_id: u32,
     /// Number of records in segment.
     record_count: u32,
@@ -80,7 +92,8 @@ pub const Catalog = struct {
     path: [256]u8,
     path_len: u16,
 
-    const HEADER_SIZE: usize = @sizeOf(u32) + @sizeOf(u16) + @sizeOf(u16); // magic + version + entry_count = 8
+    /// magic(4) + version(2) + reserved(2) + entry_count(4) = 12
+    const HEADER_SIZE: usize = @sizeOf(u32) + @sizeOf(u16) + @sizeOf(u16) + @sizeOf(u32);
 
     pub fn init(allocator: std.mem.Allocator, base_path: []const u8) !Catalog {
         var cat = Catalog{
@@ -153,6 +166,9 @@ pub const Catalog = struct {
     }
 
     /// Find segments by stream_id. Caller must free the returned slice.
+    /// Entries whose stream_id is the reserved "mixed" sentinel (0) match
+    /// every query — see the CatalogEntry.stream_id doc; producers must use
+    /// stream ids >= 1.
     pub fn findByStream(self: *const Catalog, stream_id: u32) ![]CatalogEntry {
         // Count matching entries.
         var count: usize = 0;
@@ -188,31 +204,64 @@ pub const Catalog = struct {
     }
 
     /// Save catalog to disk.
-    /// File format: [magic:u32][version:u16][entry_count:u16][entries...]
+    /// File format: [magic:u32][version:u16][reserved:u16][entry_count:u32][entries...]
+    ///
+    /// Crash-safe atomic write (same recipe as the cluster snapshot/WAL):
+    /// write `catalog.zbct.tmp`, fsync it, rename over the final name, fsync
+    /// the directory. A crash mid-save leaves either the old catalog or the
+    /// new one — never a torn file (the previous truncate-in-place version
+    /// lost ALL segment metadata if the process died mid-write).
     pub fn save(self: *const Catalog) !void {
         const path_slice = self.path[0..self.path_len];
+
+        if (self.entries.items.len > std.math.maxInt(u32)) {
+            return error.TooManyEntries;
+        }
 
         // Ensure parent directory exists.
         if (std.mem.lastIndexOfScalar(u8, path_slice, '/')) |sep| {
             std.fs.cwd().makePath(path_slice[0..sep]) catch {};
         }
 
-        const file = try std.fs.cwd().createFile(path_slice, .{ .truncate = true });
-        defer file.close();
+        var tmp_path_buf: [264]u8 = undefined;
+        const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path_slice}) catch
+            return error.PathTooLong;
 
-        // Write header.
-        var header: [HEADER_SIZE]u8 = undefined;
-        std.mem.writeInt(u32, header[0..4], CATALOG_MAGIC, .little);
-        std.mem.writeInt(u16, header[4..6], CATALOG_VERSION, .little);
-        const entry_count: u16 = @intCast(self.entries.items.len);
-        std.mem.writeInt(u16, header[6..8], entry_count, .little);
-        try file.writeAll(&header);
+        // On any failure below, remove the temp file so it cannot linger.
+        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
 
-        // Write entries.
-        var buf: [CatalogEntry.SERIALIZED_SIZE]u8 = undefined;
-        for (self.entries.items) |entry| {
-            entry.serialize(&buf);
-            try file.writeAll(&buf);
+        // 1. Write the temp file and fsync it before rename.
+        {
+            const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+            defer file.close();
+
+            // Write header.
+            var header: [HEADER_SIZE]u8 = undefined;
+            std.mem.writeInt(u32, header[0..4], CATALOG_MAGIC, .little);
+            std.mem.writeInt(u16, header[4..6], CATALOG_VERSION, .little);
+            std.mem.writeInt(u16, header[6..8], 0, .little); // reserved
+            const entry_count: u32 = @intCast(self.entries.items.len);
+            std.mem.writeInt(u32, header[8..12], entry_count, .little);
+            try file.writeAll(&header);
+
+            // Write entries.
+            var buf: [CatalogEntry.SERIALIZED_SIZE]u8 = undefined;
+            for (self.entries.items) |entry| {
+                entry.serialize(&buf);
+                try file.writeAll(&buf);
+            }
+
+            try file.sync();
+        }
+
+        // 2. Atomically replace the previous catalog.
+        try std.fs.cwd().rename(tmp_path, path_slice);
+
+        // 3. Make the rename itself durable.
+        if (std.mem.lastIndexOfScalar(u8, path_slice, '/')) |sep| {
+            var dir = try std.fs.cwd().openDir(path_slice[0..sep], .{});
+            defer dir.close();
+            try syncDir(dir);
         }
     }
 
@@ -238,7 +287,17 @@ pub const Catalog = struct {
             return error.UnsupportedVersion;
         }
 
-        const entry_count = std.mem.readInt(u16, header[6..8], .little);
+        const entry_count = std.mem.readInt(u32, header[8..12], .little);
+
+        // Cap entry_count against the actual file size BEFORE allocating:
+        // a corrupt count of 0xFFFFFFFF would otherwise drive
+        // ensureTotalCapacity to a ~240 GB allocation.
+        const file_size = try file.getEndPos();
+        const data_bytes = file_size -| HEADER_SIZE;
+        const max_entries = data_bytes / CatalogEntry.SERIALIZED_SIZE;
+        if (entry_count > max_entries) {
+            return error.CorruptCatalog;
+        }
 
         // Read entries.
         var entries = std.ArrayListUnmanaged(CatalogEntry){};
@@ -514,6 +573,86 @@ test "Catalog save and load from disk" {
     try std.testing.expectEqual(@as(u32, 1), e1.segment_id);
     try std.testing.expectEqual(@as(u64, 2048), e1.end_offset);
     try std.testing.expect(!e1.closed);
+}
+
+test "Catalog save is atomic: no temp file left, repeated saves survive reopen" {
+    const test_path = "/tmp/zigbolt_test_cat_atomic";
+    std.fs.cwd().deleteTree(test_path) catch {};
+    defer std.fs.cwd().deleteTree(test_path) catch {};
+
+    const entry_template = CatalogEntry{
+        .segment_id = 0,
+        .start_offset = 0,
+        .end_offset = 100,
+        .start_timestamp_ns = 1,
+        .end_timestamp_ns = 2,
+        .stream_id = 1,
+        .record_count = 1,
+        .total_bytes = 10,
+        .closed = true,
+    };
+
+    {
+        var cat = try Catalog.init(std.testing.allocator, test_path);
+        defer cat.deinit();
+        try cat.addEntry(entry_template);
+        try cat.save();
+
+        // Save again with more entries: the file is replaced via rename,
+        // never truncated in place, so a crash can't tear it.
+        var e2 = entry_template;
+        e2.segment_id = 1;
+        try cat.addEntry(e2);
+        try cat.save();
+    }
+
+    // No stale .tmp file after a successful save.
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.fs.cwd().openFile(test_path ++ "/catalog.zbct.tmp", .{}),
+    );
+
+    var loaded = try Catalog.load(std.testing.allocator, test_path ++ "/catalog.zbct");
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 2), loaded.segmentCount());
+    try std.testing.expect(loaded.getEntry(1) != null);
+}
+
+test "Catalog load rejects corrupt entry_count without huge allocation" {
+    const test_path = "/tmp/zigbolt_test_cat_badcount";
+    std.fs.cwd().deleteTree(test_path) catch {};
+    defer std.fs.cwd().deleteTree(test_path) catch {};
+
+    {
+        var cat = try Catalog.init(std.testing.allocator, test_path);
+        defer cat.deinit();
+        try cat.addEntry(.{
+            .segment_id = 0,
+            .start_offset = 0,
+            .end_offset = 100,
+            .start_timestamp_ns = 1,
+            .end_timestamp_ns = 2,
+            .stream_id = 1,
+            .record_count = 1,
+            .total_bytes = 10,
+            .closed = true,
+        });
+        try cat.save();
+    }
+
+    // Corrupt entry_count (header offset 8) to 0xFFFFFFFF: would have driven
+    // ensureTotalCapacity to a ~240 GB allocation before the file-size cap.
+    {
+        const f = try std.fs.cwd().openFile(test_path ++ "/catalog.zbct", .{ .mode = .read_write });
+        defer f.close();
+        try f.seekTo(8);
+        try f.writeAll(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+    }
+
+    try std.testing.expectError(
+        error.CorruptCatalog,
+        Catalog.load(std.testing.allocator, test_path ++ "/catalog.zbct"),
+    );
 }
 
 test "Catalog totalRecords and totalBytes" {

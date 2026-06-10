@@ -90,10 +90,14 @@ test "RawSubscriber poll on empty channel" {
     defer ch.deinit();
 
     var sub = RawSubscriber.init(&ch);
-    const count = sub.poll(&struct {
+    const H = struct {
         fn handler(_: IpcChannel.ReadResult) void {}
-    }.handler, 10);
-    try std.testing.expectEqual(@as(u32, 0), count);
+    };
+    try std.testing.expectEqual(@as(u32, 0), sub.poll(&H.handler, 10));
+
+    // The same no-op handler runs once a message exists.
+    try ch.publish("now nonempty", 1);
+    try std.testing.expectEqual(@as(u32, 1), sub.poll(&H.handler, 10));
 }
 
 test "Subscriber typed creation" {

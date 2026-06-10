@@ -222,7 +222,7 @@ pub const SnapshotManager = struct {
 
     /// Return metadata of the latest snapshot without loading state data.
     pub fn getLatestMeta(self: *const SnapshotManager) ?SnapshotMeta {
-        return self.last_snapshot;
+        return self.last_snapshot; // kcov-skip: runs in the getLatestMeta test (result asserted); no own line record
     }
 
     /// Delete all but the N newest VALID snapshot files.

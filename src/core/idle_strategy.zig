@@ -354,3 +354,15 @@ test "Sleeping idle with work_count > 0 does not sleep" {
     // Should return almost immediately
     try std.testing.expect(elapsed < 10_000_000); // < 10ms
 }
+
+test "Yielding reset and Sleeping init are usable" {
+    var y = YieldingIdleStrategy{};
+    y.idle(0);
+    y.reset();
+
+    var s = SleepingIdleStrategy.init(500);
+    try std.testing.expectEqual(@as(u64, 500), s.sleep_ns);
+    s.idle(1); // work done: no sleep
+    s.idle(0); // idle: sleeps 500 ns
+    s.reset();
+}

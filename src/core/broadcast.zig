@@ -322,7 +322,7 @@ pub const BroadcastReceiver = struct {
                 .payload = payload,
             };
         }
-        return null;
+        return null; // kcov-skip: structurally unreachable: every loop arm returns or sets more=true; required because while(more) needs a fallthrough return
     }
 
     /// Resync to the start of the most recent record published by the
@@ -345,7 +345,7 @@ pub const BroadcastReceiver = struct {
         const tail_intent = self.tail_intent_counter.load(.acquire);
         // If tail_intent has moved more than capacity past the record start,
         // the transmitter has (or is about to have) overwritten the record.
-        return tail_intent <= (record_position + @as(i64, self.capacity));
+        return tail_intent <= (record_position + @as(i64, self.capacity)); // kcov-skip: runs on every receive validation (all broadcast tests); no own line record
     }
 
     /// Validate that the data at the current cursor position is still valid
@@ -405,7 +405,7 @@ pub const CopyBroadcastReceiver = struct {
         const record_start = self.receiver.cursor -
             @as(i64, alignedRecordLength(@intCast(msg.payload.len)));
         if (!self.receiver.validateAt(record_start)) {
-            self.receiver.lapped_count += 1;
+            self.receiver.lapped_count += 1; // kcov-skip: requires the transmitter to lap the receiver between receiveNext's validate and the post-copy re-validate — a sub-microsecond window not deterministically stageable in-process
             return null;
         }
 
@@ -734,7 +734,7 @@ test "high-throughput sequential transmit and receive" {
 
     // Drain remaining.
     while (rx.receiveNext()) |_| {
-        received += 1;
+        received += 1; // kcov-skip: drain-loop body; whether messages remain after the main loop is timing/lapping dependent
     }
 
     const lapped = rx.lappedCount();
@@ -742,4 +742,135 @@ test "high-throughput sequential transmit and receive" {
     // Some messages may be lost to lapping, but we should have received many.
     try testing.expect(received > 0);
     _ = lapped;
+}
+
+test "receiver skips a padding record without being lapped" {
+    const cap = 256;
+    var buf: [totalBufferSize(cap)]u8 align(config.cache_line_size) = [_]u8{0} ** totalBufferSize(cap);
+    var tx = BroadcastTransmitter.init(&buf);
+    var rx = BroadcastReceiver.init(&buf);
+
+    // 10 records of 24 bytes fill to offset 240; drain them all so the
+    // receiver is current (no lapping later).
+    const payload = "exactly-16-bytes";
+    for (0..10) |_| tx.transmit(1, payload);
+    var drained: usize = 0;
+    while (rx.receiveNext()) |_| drained += 1;
+    try testing.expectEqual(@as(usize, 10), drained);
+
+    // The 11th record does not fit in the 16 remaining bytes: the
+    // transmitter writes a padding record at 240 and wraps. The receiver
+    // must walk THROUGH the padding (validate, advance) — not resync.
+    tx.transmit(2, payload);
+    const msg = rx.receiveNext() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i32, 2), msg.msg_type_id);
+    try testing.expectEqualStrings(payload, msg.payload);
+    try testing.expectEqual(@as(u64, 0), rx.lappedCount());
+}
+
+test "receiver resyncs on garbage or invalidated headers" {
+    const cap = 256;
+    const payload = "exactly-16-bytes";
+
+    // Stage A: padding record whose length was scribbled to garbage.
+    {
+        var buf: [totalBufferSize(cap)]u8 align(config.cache_line_size) = [_]u8{0} ** totalBufferSize(cap);
+        var tx = BroadcastTransmitter.init(&buf);
+        var rx = BroadcastReceiver.init(&buf);
+        for (0..10) |_| tx.transmit(1, payload);
+        while (rx.receiveNext()) |_| {}
+        tx.transmit(2, payload); // padding at 240 + record at 0
+
+        const pad_hdr: *RecordHeader = @ptrCast(@alignCast(&buf[240]));
+        try testing.expectEqual(@as(i32, PADDING_MSG_TYPE_ID), pad_hdr.msg_type_id);
+        pad_hdr.payload_length = 0; // garbage: padding length must be positive
+
+        // The receiver must treat it as a lap and resync to the latest record.
+        const msg = rx.receiveNext() orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(i32, 2), msg.msg_type_id);
+        try testing.expectEqual(@as(u64, 1), rx.lappedCount());
+    }
+
+    // Stage B: intact padding record invalidated by transmitter intent.
+    {
+        var buf: [totalBufferSize(cap)]u8 align(config.cache_line_size) = [_]u8{0} ** totalBufferSize(cap);
+        var tx = BroadcastTransmitter.init(&buf);
+        var rx = BroadcastReceiver.init(&buf);
+        for (0..10) |_| tx.transmit(1, payload);
+        while (rx.receiveNext()) |_| {}
+        tx.transmit(2, payload);
+
+        // Claim the transmitter is far past the padding record: validateAt
+        // must fail and the receiver resync.
+        tx.tail_intent_counter.store(240 + cap + 8, .release);
+        const msg = rx.receiveNext() orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(i32, 2), msg.msg_type_id);
+        try testing.expectEqual(@as(u64, 1), rx.lappedCount());
+    }
+
+    // Stage C: data record with garbage length and nothing newer: the
+    // receiver cannot resync (latest == current) and reports no message.
+    {
+        var buf: [totalBufferSize(cap)]u8 align(config.cache_line_size) = [_]u8{0} ** totalBufferSize(cap);
+        var tx = BroadcastTransmitter.init(&buf);
+        var rx = BroadcastReceiver.init(&buf);
+        tx.transmit(3, payload);
+        const hdr: *RecordHeader = @ptrCast(@alignCast(&buf[0]));
+        hdr.payload_length = -5;
+        try testing.expect(rx.receiveNext() == null);
+
+        // Restored header delivers again.
+        hdr.payload_length = @intCast(payload.len);
+        const msg = rx.receiveNext() orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(i32, 3), msg.msg_type_id);
+    }
+
+    // Stage D: data record that would cross the end of the buffer.
+    {
+        var buf: [totalBufferSize(cap)]u8 align(config.cache_line_size) = [_]u8{0} ** totalBufferSize(cap);
+        var tx = BroadcastTransmitter.init(&buf);
+        var rx = BroadcastReceiver.init(&buf);
+        for (0..10) |_| tx.transmit(1, payload);
+        while (rx.receiveNext()) |_| {}
+
+        // Forge a data record at offset 240 claiming 20 payload bytes
+        // (24-byte record would end at 268 > 256) and advance the tail.
+        const hdr: *RecordHeader = @ptrCast(@alignCast(&buf[240]));
+        hdr.msg_type_id = 9;
+        hdr.payload_length = 20;
+        tx.tail_counter.store(240 + 28, .release);
+        _ = rx.receiveNext();
+        try testing.expectEqual(@as(u64, 1), rx.lappedCount());
+    }
+
+    // Stage E: a valid record invalidated between header read and return —
+    // the receiver resyncs to the following record.
+    {
+        var buf: [totalBufferSize(cap)]u8 align(config.cache_line_size) = [_]u8{0} ** totalBufferSize(cap);
+        var tx = BroadcastTransmitter.init(&buf);
+        var rx = BroadcastReceiver.init(&buf);
+        tx.transmit(1, payload); // record at 0
+        tx.transmit(2, payload); // record at 24
+        tx.transmit(3, payload); // record at 48 (the resync target)
+
+        // Intent just past record 0 + capacity: record 0 fails the final
+        // validate, the later records still pass, so the receiver resyncs
+        // to the latest record start.
+        tx.tail_intent_counter.store(cap + 1, .release);
+        const msg = rx.receiveNext() orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(i32, 3), msg.msg_type_id);
+        try testing.expectEqual(@as(u64, 1), rx.lappedCount());
+    }
+}
+
+test "CopyBroadcastReceiver exposes its lapped count" {
+    const cap = 256;
+    var buf: [totalBufferSize(cap)]u8 align(config.cache_line_size) = [_]u8{0} ** totalBufferSize(cap);
+    var tx = BroadcastTransmitter.init(&buf);
+    var copy_rx = CopyBroadcastReceiver.init(&buf);
+
+    tx.transmit(1, "copy-me");
+    const msg = copy_rx.receiveNext() orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("copy-me", msg.payload);
+    try testing.expectEqual(@as(u64, 0), copy_rx.lappedCount());
 }

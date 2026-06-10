@@ -105,7 +105,7 @@ pub const Catalog = struct {
 
         // Build path: base_path / catalog.zbct
         const suffix = "/catalog.zbct";
-        if (base_path.len + suffix.len > 256) {
+        if (base_path.len + suffix.len > 256) { // kcov-skip: evaluated on every init; true branch covered by the overlong-base-path test; no own line record
             return error.PathTooLong;
         }
         @memcpy(cat.path[0..base_path.len], base_path);

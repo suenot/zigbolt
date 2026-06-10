@@ -95,7 +95,7 @@ pub const Transport = struct {
 
         ch.* = try IpcChannel.create(name.ptr, .{
             .term_length = self.config.term_length,
-            .use_hugepages = self.config.use_hugepages,
+            .use_hugepages = self.config.use_hugepages, // kcov-skip: runs on every channel create (transport tests); literal field store folded, no own line record
             .pre_fault = self.config.pre_fault,
         });
         errdefer ch.deinit();
@@ -217,4 +217,77 @@ test "Transport channel factory does not leak on open failure" {
         transport.addRawSubscription("/zigbolt_test_transport_noexist"),
     );
     try std.testing.expectEqual(@as(u32, 0), transport.channels.count());
+}
+
+test "Transport typed and raw roundtrip; second transport opens existing channel" {
+    const TickMessage = @import("../codec/wire.zig").TickMessage;
+
+    var transport = Transport.init(std.testing.allocator, .{ .term_length = 4096 });
+    defer transport.deinit();
+
+    var publisher = try transport.addPublication(TickMessage, "/zb_t_rt", 3);
+    var subscriber = try transport.addSubscription(TickMessage, "/zb_t_rt", 3);
+
+    const tick = TickMessage{
+        .timestamp_ns = 42,
+        .symbol_id = 7,
+        .price = 12345,
+        .volume = 10,
+        .side = .bid,
+    };
+    try std.testing.expect(try publisher.tryOffer(&tick));
+
+    const S = struct {
+        var got: u32 = 0;
+        var last_price: i64 = 0;
+        fn handler(msg: *align(1) const TickMessage) void {
+            got += 1;
+            last_price = msg.price;
+        }
+    };
+    S.got = 0;
+    try std.testing.expectEqual(@as(u32, 1), subscriber.poll(&S.handler, 10));
+    try std.testing.expectEqual(@as(u32, 1), S.got);
+    try std.testing.expectEqual(@as(i64, 12345), S.last_price);
+
+    // Raw subscription on the SAME transport reuses the cached channel.
+    var raw_sub = try transport.addRawSubscription("/zb_t_rt");
+    _ = &raw_sub;
+
+    // A second transport must OPEN the existing shm channel (not create).
+    var t2 = Transport.init(std.testing.allocator, .{ .term_length = 4096 });
+    defer t2.deinit();
+    var sub2 = try t2.addRawSubscription("/zb_t_rt");
+    _ = &sub2;
+    try std.testing.expectEqual(@as(u32, 1), t2.channels.count());
+}
+
+test "Transport channel factories survive allocation failure at every point" {
+    // Create path.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var t = Transport.init(allocator, .{ .term_length = 4096 });
+            defer t.deinit();
+            _ = try t.addRawPublication("/zb_t_oomc", 1);
+        }
+    }.run, .{});
+
+    // Open path (channel pre-created by a healthy owner).
+    var owner = Transport.init(std.testing.allocator, .{ .term_length = 4096 });
+    defer owner.deinit();
+    _ = try owner.addRawPublication("/zb_t_oomo", 1);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var t = Transport.init(allocator, .{ .term_length = 4096 });
+            defer t.deinit();
+            _ = try t.addRawSubscription("/zb_t_oomo");
+        }
+    }.run, .{});
+}
+
+test "Transport surfaces channel-create failure without leaking" {
+    var t = Transport.init(std.testing.allocator, .{ .term_length = 0 });
+    defer t.deinit();
+    try std.testing.expectError(error.InvalidTermLength, t.addRawPublication("/zb_t_bad", 1));
+    try std.testing.expectEqual(@as(u32, 0), t.channels.count());
 }

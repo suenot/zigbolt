@@ -194,3 +194,26 @@ test "Publisher tryOffer returns false on back-pressure, true otherwise" {
     }
     try std.testing.expect(back_pressured);
 }
+
+test "tryOffer surfaces non-backpressure channel errors" {
+    const TickMessage = @import("../codec/wire.zig").TickMessage;
+
+    const name = "/zigbolt_test_pub_corrupt";
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
+    defer ch.deinit();
+
+    var publisher = Publisher(TickMessage).init(&ch, 1);
+    const tick = TickMessage{
+        .timestamp_ns = 1,
+        .symbol_id = 1,
+        .price = 1,
+        .volume = 1,
+        .side = .bid,
+    };
+
+    // Corrupt the shared header (reader ahead of writer): publish must
+    // surface CorruptChannel — distinct from BackPressure's `false`.
+    ch.meta.head_position.store(8192, .monotonic);
+    ch.meta.tail_position.store(0, .monotonic);
+    try std.testing.expectError(error.CorruptChannel, publisher.tryOffer(&tick));
+}

@@ -58,7 +58,7 @@ pub const Cluster = struct {
             defer snap.deinit();
             if (sm) |s| {
                 if (s.restore_fn) |restore| {
-                    restore(snap.data);
+                    restore(snap.data); // kcov-skip: executes in the snapshot-restore test (restored content asserted, verified passing on Linux); indirect call carries no own line record
                 }
             }
         }
@@ -472,9 +472,9 @@ test "Cluster restores the state machine from a recovered snapshot" {
         var restored_buf: [64]u8 = undefined;
         var restored_len: usize = 0;
         var applied: u32 = 0;
-        fn apply(entry: []const u8) void {
+        fn apply(entry: []const u8) void { // kcov-skip: intentionally never invoked: the test asserts the snapshotted prefix is NOT re-applied
             _ = entry;
-            applied += 1;
+            applied += 1; // kcov-skip: intentionally never invoked: the test asserts the snapshotted prefix is NOT re-applied
         }
         fn restore(snapshot: []const u8) void {
             const n = @min(snapshot.len, restored_buf.len);

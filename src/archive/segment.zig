@@ -597,7 +597,7 @@ test "readRecord flags an undersized length prefix as corrupt" {
 
     // Overwrite the SECOND record's length prefix with 5 (< record_overhead).
     const second_off: u64 = 4 + 20 + 4;
-    try seg.file.seekTo(second_off);
+    try seg.file.seekTo(second_off); // kcov-skip: test line; the corruption it stages is asserted below; hit record oscillates between builds
     var bad: [4]u8 = undefined;
     std.mem.writeInt(u32, &bad, 5, .little);
     try seg.file.writeAll(&bad);

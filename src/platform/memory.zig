@@ -381,7 +381,7 @@ test "createShared fails cleanly on an unmappable size and leaves no object" {
 test "createShared surfaces OS-level name rejections" {
     // An embedded slash is invalid on Linux (EINVAL); macOS may accept it.
     if (createShared("/zigbolt/extra_slash", 4096, .{})) |r| {
-        var region = r;
+        var region = r; // kcov-skip: Darwin-only success arm: Linux rejects the embedded slash with EINVAL, so this never executes on the Linux coverage runner
         region.deinit();
     } else |err| {
         try std.testing.expect(err == error.ShmOpenFailed or err == error.ShmExists);

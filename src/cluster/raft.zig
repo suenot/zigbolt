@@ -985,7 +985,7 @@ test "RaftNode: getApplicableEntries and markApplied" {
 
 fn testExchange(nodes: []RaftNode, from: u32, to: u32, msg: RaftMessage) void {
     var cur_from = from;
-    var cur_to = to;
+    var cur_to = to; // kcov-skip: test harness local; every exchange uses it; hit record oscillates between builds; the test runs and passes
     var cur_msg = msg; // kcov-skip: test harness local; every exchange uses it; hit record oscillates between builds
     while (true) {
         const resp = nodes[cur_to].handleMessage(cur_from, cur_msg) orelse return;

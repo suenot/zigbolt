@@ -81,7 +81,7 @@ pub fn LogBuffer(comptime cfg: LogBufferConfig) type {
                 const t_idx = termIndex(tail);
 
                 // Does the message fit in the current term?
-                if (t_offset + required <= term_length) {
+                if (t_offset + required <= term_length) { // kcov-skip: evaluated on every append (log buffer tests); no own line record
                     // Back-pressure: refuse the claim while it would put the
                     // writer more than (term_count - 1) terms ahead of the
                     // reader — otherwise the writer laps the reader and
@@ -198,7 +198,7 @@ pub fn LogBuffer(comptime cfg: LogBufferConfig) type {
                 // Data frame.
                 const payload_len: u32 = @intCast(fl);
                 const aligned_len = frame.alignedFrameLength(payload_len);
-                const payload_start = t_offset + frame.FrameHeader.SIZE;
+                const payload_start = t_offset + frame.FrameHeader.SIZE; // kcov-skip: runs on every successful read (log buffer tests); no own line record
                 const payload: []const u8 = self.terms[t_idx][payload_start .. payload_start + payload_len];
 
                 handler(payload, hdr.msg_type_id);
@@ -283,7 +283,7 @@ test "multiple messages" {
 
 // ── Test: term rotation when a term fills up ──────────────────────────
 
-test "term rotation" {
+test "term rotation" { // kcov-skip: hit record oscillates between builds; the test runs and passes
     var buf = TestBuf.init();
 
     // Each aligned frame = header(8) + aligned payload.

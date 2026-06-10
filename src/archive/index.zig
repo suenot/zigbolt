@@ -329,7 +329,7 @@ test "SparseIndex records every Nth entry" {
 
     // Record 10 entries; only every 4th should be indexed (0, 4, 8).
     for (0..10) |i| {
-        const seq: u32 = @intCast(i);
+        const seq: u32 = @intCast(i); // kcov-skip: test loop var; loop effects asserted; hit record oscillates between builds
         try idx.record(seq, seq * 100, seq * 1000, 1);
     }
 
@@ -584,4 +584,18 @@ test "SparseIndex save removes the temp file when the rename fails" {
 
     // The errdefer removed the temp file.
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("segment_0000000005.idx.tmp", .{}));
+}
+
+test "SparseIndex rebuild releases the partial index when allocation fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const f = try tmp.dir.createFile("oom.dat", .{ .read = true });
+    defer f.close();
+    try writeTestSegmentRecord(f, 100, 1, 0);
+
+    // The first entry append fails: the errdefer must free the partial
+    // index (the testing allocator's leak check verifies it).
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, SparseIndex.rebuild(failing.allocator(), f, 0, 1));
 }

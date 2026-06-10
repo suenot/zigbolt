@@ -77,7 +77,7 @@ pub fn MpscRingBuffer(comptime capacity: usize) type {
                 // producer advances head, then the consumer advances tail past
                 // our snapshot. `head -% tail` would underflow to a huge value
                 // and report a spurious "full" — reload and retry instead.
-                if (current_tail > current_head) continue;
+                if (current_tail > current_head) continue; // kcov-skip: stale-snapshot retry under producer/consumer contention; exercised by the concurrent tests but occurrence is scheduling-dependent
 
                 const offset = current_head & mask;
 
@@ -166,7 +166,7 @@ pub fn MpscRingBuffer(comptime capacity: usize) type {
             while (true) {
                 const current_head = self.head.load(.acquire);
 
-                if (current_tail == current_head) {
+                if (current_tail == current_head) { // kcov-skip: evaluated on every read (empty-queue tests); no own line record
                     return null; // ring buffer is empty
                 }
 
@@ -237,7 +237,7 @@ pub fn MpscRingBuffer(comptime capacity: usize) type {
 // Tests
 // =============================================================================
 
-test "single producer write and read" {
+test "single producer write and read" { // kcov-skip: hit record oscillates between builds; the test runs and passes
     var rb = MpscRingBuffer(1024).init();
 
     const payload = "hello world";

@@ -26,7 +26,9 @@ docker run --rm --platform linux/arm64 \
         # be injected). Use sparingly and always with an inline justification.
         kcov --include-pattern=$ROOT/src/ --exclude-line='kcov-skip' coverage/root zig-out/tests/root_tests >/dev/null 2>&1
         kcov --include-pattern=$ROOT/src/ --exclude-line='kcov-skip' coverage/ffi zig-out/tests/ffi_tests >/dev/null 2>&1
-        kcov --merge coverage/merged coverage/root coverage/ffi >/dev/null 2>&1
+        # --exclude-line must be repeated here: the merge re-parses the
+        # sources and would otherwise reintroduce marker lines as uncovered.
+        kcov --merge --exclude-line='kcov-skip' coverage/merged coverage/root coverage/ffi >/dev/null 2>&1
     "
 
 python3 - <<'EOF'

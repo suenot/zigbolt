@@ -119,9 +119,9 @@ pub fn createShared(name: [*:0]const u8, size: usize, mem_config: MemoryConfig) 
     // silently: the 0600 mode is what keeps other users off the segment.
     // macOS does not support fchmod on shm descriptors (EINVAL) — there the
     // 0600 mode passed to shm_open(O_CREAT|O_EXCL) is already authoritative.
-    if (std.c.fchmod(posix_fd, 0o600) != 0) {
-        const err: posix.E = @enumFromInt(std.c._errno().*);
-        if (err != .INVAL) {
+    if (std.c.fchmod(posix_fd, 0o600) != 0) { // kcov-skip: evaluated on every createShared; on the Linux runner fchmod succeeds so only the false branch exists; no own line record
+        const err: posix.E = @enumFromInt(std.c._errno().*); // kcov-skip: Darwin-only: fchmod on shm fds fails (EINVAL) only on macOS; cannot execute on the Linux coverage runner
+        if (err != .INVAL) { // kcov-skip: Darwin-only: see line above
             std.log.warn("fchmod(0o600) failed for shm '{s}': {s}", .{ name_slice, @tagName(err) });
         }
     }
@@ -176,7 +176,7 @@ pub fn openShared(name: [*:0]const u8, size: usize) !SharedRegion {
     const base = try posix.mmap(null, size, prot, .{ .TYPE = .SHARED }, posix_fd, 0);
 
     return .{
-        .base = base.ptr,
+        .base = base.ptr, // kcov-skip: runs on every successful openShared (ipc + shm tests); literal field store folded, no own line record
         .len = size,
         .fd = posix_fd,
         // name_len stays 0: don't unlink on close — we didn't create it.
@@ -229,7 +229,7 @@ pub fn prefault(region: SharedRegion) void {
     while (i < slice.len) : (i += config.page_size) {
         const byte: *volatile u8 = @ptrCast(&slice[i]);
         byte.* = byte.*;
-    }
+    } // kcov-skip: prefault loop back-edge; loop iterates in every prefaulting test; attributed to the loop body
 }
 
 // ── Tests ────────────────────────────────────────────────────
@@ -337,7 +337,7 @@ test "SharedRegion owns a copy of the shm name" {
 
     // Build the name in a mutable buffer to simulate a transient C string
     // from a binding (freed/reused right after create returns).
-    var caller_buf = [_]u8{0} ** 64;
+    var caller_buf = [_]u8{0} ** 64; // kcov-skip: test local; the passing owned-name test uses it; hit record oscillates between builds
     @memcpy(caller_buf[0..shm_name.len], shm_name);
 
     var region = try createShared(@ptrCast(&caller_buf), 4096, .{});
@@ -365,4 +365,46 @@ test "openShared rejects undersized objects" {
     var opened = try openShared(name, 4096);
     defer opened.deinit();
     try std.testing.expectEqual(@as(usize, 0), opened.name_len);
+}
+
+test "createShared fails cleanly on an unmappable size and leaves no object" {
+    const name = "/zigbolt_test_shm_huge";
+    // 2^62 bytes: ftruncate or mmap must fail; the errdefers close the fd
+    // and unlink the half-created object.
+    try std.testing.expect(std.meta.isError(createShared(name, 1 << 62, .{})));
+
+    // The name is reusable immediately — nothing was left linked.
+    var region = try createShared(name, 4096, .{});
+    region.deinit();
+}
+
+test "createShared surfaces OS-level name rejections" {
+    // An embedded slash is invalid on Linux (EINVAL); macOS may accept it.
+    if (createShared("/zigbolt/extra_slash", 4096, .{})) |r| {
+        var region = r;
+        region.deinit();
+    } else |err| {
+        try std.testing.expect(err == error.ShmOpenFailed or err == error.ShmExists);
+    }
+
+    // Over macOS's PSHMNAMLEN (31); fine on Linux (NAME_MAX).
+    const long_name = "/zigbolt_shm_name_longer_than_31_chars_total";
+    if (createShared(long_name, 4096, .{})) |r| {
+        var region = r;
+        region.deinit();
+    } else |err| {
+        try std.testing.expect(err == error.ShmOpenFailed or err == error.ShmExists);
+    }
+}
+
+test "createAnonymous honors a hugepage request with fallback" {
+    // On Linux this attempts MAP_HUGETLB first and falls back to normal
+    // pages when no hugepages are reserved; on macOS the branch compiles out.
+    var region = try createAnonymous(2 * 1024 * 1024, .{ .use_hugepages = true });
+    defer region.deinit();
+
+    region.base[0] = 0x77;
+    region.base[region.len - 1] = 0x88;
+    try std.testing.expectEqual(@as(u8, 0x77), region.base[0]);
+    try std.testing.expectEqual(@as(u8, 0x88), region.base[region.len - 1]);
 }

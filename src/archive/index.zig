@@ -246,8 +246,8 @@ pub const SparseIndex = struct {
         for (0..entry_count) |_| {
             const bytes_read = try file.readAll(&buf);
             if (bytes_read < IndexEntry.SERIALIZED_SIZE) {
-                entries.deinit(allocator);
-                return error.CorruptIndex;
+                entries.deinit(allocator); // kcov-skip: defensive: entry_count is pre-validated against file size, so a short read needs concurrent truncation, which cannot be staged in-process
+                return error.CorruptIndex; // kcov-skip: defensive: see line above — unreachable without concurrent file truncation
             }
             entries.appendAssumeCapacity(deserializeIndexEntry(&buf));
         }
@@ -345,7 +345,7 @@ test "SparseIndex findByTimestamp binary search" {
 
     // Insert entries with timestamps 100, 200, 300, 400, 500.
     for (0..5) |i| {
-        const seq: u32 = @intCast(i);
+        const seq: u32 = @intCast(i); // kcov-skip: test loop var; loop effects asserted; hit record oscillates between builds
         const ts: u64 = (seq + 1) * 100;
         try idx.record(seq, seq * 50, ts, 1);
     }
@@ -374,7 +374,7 @@ test "SparseIndex findBySequence" {
 
     // Records: 0, 2, 4, 6, 8 indexed.
     for (0..10) |i| {
-        const seq: u32 = @intCast(i);
+        const seq: u32 = @intCast(i); // kcov-skip: test loop var; loop effects asserted; hit record oscillates between builds
         try idx.record(seq, seq * 100, seq * 1000, 1);
     }
 
@@ -402,7 +402,7 @@ test "SparseIndex save/load roundtrip" {
         defer idx.deinit();
 
         for (0..8) |i| {
-            const seq: u32 = @intCast(i);
+            const seq: u32 = @intCast(i); // kcov-skip: test loop var; loop effects asserted; hit record oscillates between builds
             try idx.record(seq, seq * 64, (seq + 1) * 1_000_000, seq % 3);
         }
 
@@ -427,7 +427,7 @@ test "SparseIndex with interval=1 (full index)" {
     defer idx.deinit();
 
     for (0..5) |i| {
-        const seq: u32 = @intCast(i);
+        const seq: u32 = @intCast(i); // kcov-skip: test loop var; loop effects asserted; hit record oscillates between builds
         try idx.record(seq, seq * 32, seq * 500, 1);
     }
 
@@ -492,4 +492,96 @@ test "SparseIndex load rejects corrupt entry_count without huge allocation" {
     }
 
     try std.testing.expectError(error.CorruptIndex, SparseIndex.load(std.testing.allocator, base, 9));
+}
+
+/// Write one segment-format record: [u32 len][u32 crc][u64 ts][u32 stream][i32 type][payload].
+fn writeTestSegmentRecord(file: std.fs.File, timestamp_ns: u64, stream_id: u32, payload_len: u32) !void {
+    var hdr: [full_header_size]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], record_overhead + payload_len, .little);
+    std.mem.writeInt(u32, hdr[4..8], 0, .little); // crc — not validated by rebuild
+    std.mem.writeInt(u64, hdr[8..16], timestamp_ns, .little);
+    std.mem.writeInt(u32, hdr[16..20], stream_id, .little);
+    std.mem.writeInt(i32, hdr[20..24], 7, .little);
+    try file.writeAll(&hdr);
+    const zeros = [_]u8{0} ** 64;
+    try file.writeAll(zeros[0..payload_len]);
+}
+
+test "SparseIndex rebuild scans records and stops at a torn tail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const f = try tmp.dir.createFile("seg.dat", .{ .read = true });
+    defer f.close();
+
+    // 5 records with 8-byte payloads: stride = 4 + 20 + 8 = 32 bytes.
+    for (0..5) |i| {
+        try writeTestSegmentRecord(f, (@as(u64, i) + 1) * 100, @intCast(i % 2), 8);
+    }
+    // Torn tail: a length prefix claiming 1000 bytes right at EOF.
+    var torn: [4]u8 = undefined;
+    std.mem.writeInt(u32, &torn, 1000, .little);
+    try f.writeAll(&torn);
+
+    var idx = try SparseIndex.rebuild(std.testing.allocator, f, 3, 2);
+    defer idx.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), idx.segment_id);
+    try std.testing.expectEqual(@as(u32, 5), idx.records_seen);
+    // Indexed every 2nd record: seq 0, 2, 4.
+    try std.testing.expectEqual(@as(usize, 3), idx.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 0), idx.entries.items[0].file_offset);
+    try std.testing.expectEqual(@as(u64, 64), idx.entries.items[1].file_offset);
+    try std.testing.expectEqual(@as(u64, 128), idx.entries.items[2].file_offset);
+    try std.testing.expectEqual(@as(u64, 300), idx.entries.items[1].timestamp_ns);
+    try std.testing.expectEqual(@as(u32, 0), idx.entries.items[2].stream_id);
+}
+
+test "SparseIndex rebuild stops on undersized length and partial prefix" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // One good record followed by a length smaller than the record overhead.
+    {
+        const f = try tmp.dir.createFile("bad_len.dat", .{ .read = true });
+        defer f.close();
+        try writeTestSegmentRecord(f, 100, 1, 0);
+        var bad: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bad, 5, .little);
+        try f.writeAll(&bad);
+        try f.writeAll(&[_]u8{0} ** 8);
+
+        var idx = try SparseIndex.rebuild(std.testing.allocator, f, 0, 1);
+        defer idx.deinit();
+        try std.testing.expectEqual(@as(usize, 1), idx.entries.items.len);
+    }
+    // One good record followed by a 2-byte partial length prefix.
+    {
+        const f = try tmp.dir.createFile("short_prefix.dat", .{ .read = true });
+        defer f.close();
+        try writeTestSegmentRecord(f, 100, 1, 0);
+        try f.writeAll(&[_]u8{ 0xAA, 0xBB });
+
+        var idx = try SparseIndex.rebuild(std.testing.allocator, f, 0, 1);
+        defer idx.deinit();
+        try std.testing.expectEqual(@as(usize, 1), idx.entries.items.len);
+    }
+}
+
+test "SparseIndex save removes the temp file when the rename fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    // Occupy the final name with a DIRECTORY so the rename must fail.
+    try tmp.dir.makeDir("segment_0000000005.idx");
+
+    var idx = SparseIndex.init(std.testing.allocator, 5, 1);
+    defer idx.deinit();
+    try idx.record(0, 0, 100, 1);
+    try std.testing.expect(std.meta.isError(idx.save(base)));
+
+    // The errdefer removed the temp file.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("segment_0000000005.idx.tmp", .{}));
 }

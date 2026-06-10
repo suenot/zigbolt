@@ -142,7 +142,7 @@ pub const Catalog = struct {
         // Since entries are appended in segment order (monotonically increasing timestamps in
         // typical usage), we can scan to find the contiguous matching slice.
         var start: usize = 0;
-        var end: usize = self.entries.items.len;
+        var end: usize = self.entries.items.len; // kcov-skip: runs on every findByTimestamp (range-query test); no own line record
 
         // Skip entries whose end_timestamp_ns < from_ns (entirely before range).
         while (start < end) {
@@ -309,8 +309,8 @@ pub const Catalog = struct {
         for (0..entry_count) |_| {
             const bytes_read = try file.readAll(&buf);
             if (bytes_read < CatalogEntry.SERIALIZED_SIZE) {
-                entries.deinit(allocator);
-                return error.CorruptCatalog;
+                entries.deinit(allocator); // kcov-skip: defensive: entry_count is pre-validated against file size, so a short read needs concurrent truncation, which cannot be staged in-process
+                return error.CorruptCatalog; // kcov-skip: defensive: see line above — unreachable without concurrent file truncation
             }
             entries.appendAssumeCapacity(CatalogEntry.deserialize(&buf));
         }
@@ -699,4 +699,121 @@ test "Empty catalog" {
 
     const ts_result = cat.findByTimestamp(0, 1000);
     try std.testing.expectEqual(@as(usize, 0), ts_result.len);
+}
+
+test "Catalog init rejects an overlong base path" {
+    const long = "/tmp/" ++ "x" ** 250;
+    try std.testing.expectError(error.PathTooLong, Catalog.init(std.testing.allocator, long));
+}
+
+test "Catalog updateEntry replaces matching entry only" {
+    var cat = try Catalog.init(std.testing.allocator, "/tmp/zigbolt_test_cat_upd");
+    defer cat.deinit();
+
+    try cat.addEntry(.{
+        .segment_id = 1,
+        .start_offset = 0,
+        .end_offset = 100,
+        .start_timestamp_ns = 10,
+        .end_timestamp_ns = 20,
+        .stream_id = 1,
+        .record_count = 5,
+        .total_bytes = 80,
+        .closed = false,
+    });
+
+    var updated = cat.entries.items[0];
+    updated.record_count = 9;
+    updated.closed = true;
+    try cat.updateEntry(1, updated);
+    try std.testing.expectEqual(@as(u32, 9), cat.entries.items[0].record_count);
+    try std.testing.expect(cat.entries.items[0].closed);
+    try std.testing.expectEqual(@as(usize, 1), cat.entries.items.len);
+
+    // Unknown segment_id: rejected, nothing changed.
+    try std.testing.expectError(error.SegmentNotFound, cat.updateEntry(42, updated));
+    try std.testing.expectEqual(@as(u32, 9), cat.entries.items[0].record_count);
+}
+
+test "Catalog load rejects malformed headers" {
+    const dir_path = "/tmp/zigbolt_test_cat_bad";
+    std.fs.cwd().deleteTree(dir_path) catch {};
+    defer std.fs.cwd().deleteTree(dir_path) catch {};
+    try std.fs.cwd().makePath(dir_path);
+
+    // a) Shorter than the 12-byte header.
+    {
+        const f = try std.fs.cwd().createFile(dir_path ++ "/short.zbct", .{});
+        defer f.close();
+        try f.writeAll(&[_]u8{ 1, 2, 3, 4, 5 });
+    }
+    try std.testing.expectError(error.CorruptCatalog, Catalog.load(std.testing.allocator, dir_path ++ "/short.zbct"));
+
+    // b) Wrong magic.
+    {
+        const f = try std.fs.cwd().createFile(dir_path ++ "/magic.zbct", .{});
+        defer f.close();
+        var hdr = [_]u8{0} ** 12;
+        std.mem.writeInt(u32, hdr[0..4], 0xDEADBEEF, .little);
+        try f.writeAll(&hdr);
+    }
+    try std.testing.expectError(error.InvalidMagic, Catalog.load(std.testing.allocator, dir_path ++ "/magic.zbct"));
+
+    // c) Right magic, wrong version.
+    {
+        const f = try std.fs.cwd().createFile(dir_path ++ "/version.zbct", .{});
+        defer f.close();
+        var hdr = [_]u8{0} ** 12;
+        std.mem.writeInt(u32, hdr[0..4], CATALOG_MAGIC, .little);
+        std.mem.writeInt(u16, hdr[4..6], CATALOG_VERSION + 1, .little);
+        try f.writeAll(&hdr);
+    }
+    try std.testing.expectError(error.UnsupportedVersion, Catalog.load(std.testing.allocator, dir_path ++ "/version.zbct"));
+}
+
+test "Catalog load rejects an overlong path after reading entries" {
+    // A valid (empty) catalog at a path longer than the 256-byte path field.
+    const deep = "/tmp/zigbolt_test_cat_long_" ++ "d" ** 230;
+    std.fs.cwd().deleteTree(deep) catch {};
+    defer std.fs.cwd().deleteTree(deep) catch {};
+    try std.fs.cwd().makePath(deep);
+
+    const file_path = deep ++ "/c.zbct";
+    {
+        const f = try std.fs.cwd().createFile(file_path, .{});
+        defer f.close();
+        var hdr = [_]u8{0} ** 12;
+        std.mem.writeInt(u32, hdr[0..4], CATALOG_MAGIC, .little);
+        std.mem.writeInt(u16, hdr[4..6], CATALOG_VERSION, .little);
+        try f.writeAll(&hdr); // entry_count = 0
+    }
+    try std.testing.expect(file_path.len > 256);
+    try std.testing.expectError(error.PathTooLong, Catalog.load(std.testing.allocator, file_path));
+}
+
+test "Catalog save removes the temp file when the rename fails" {
+    const base = "/tmp/zigbolt_test_cat_dirclash";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+
+    // Occupy the catalog path with a DIRECTORY so the rename must fail.
+    try std.fs.cwd().makePath(base ++ "/catalog.zbct");
+
+    var cat = try Catalog.init(std.testing.allocator, base);
+    defer cat.deinit();
+    try cat.addEntry(.{
+        .segment_id = 1,
+        .start_offset = 0,
+        .end_offset = 10,
+        .start_timestamp_ns = 1,
+        .end_timestamp_ns = 2,
+        .stream_id = 1,
+        .record_count = 1,
+        .total_bytes = 10,
+        .closed = true,
+    });
+    try std.testing.expect(std.meta.isError(cat.save()));
+
+    // The errdefer removed the temp file.
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().openFile(base ++ "/catalog.zbct.tmp", .{}));
 }

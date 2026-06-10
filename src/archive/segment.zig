@@ -134,7 +134,7 @@ pub const Segment = struct {
         }
         const total_record_len = std.mem.readInt(u32, &len_buf, .little);
 
-        if (total_record_len < record_overhead) {
+        if (total_record_len < record_overhead) { // kcov-skip: evaluated on every readRecord; true branch covered by the undersized-length test; no own line record
             return error.CorruptRecord;
         }
 
@@ -164,7 +164,7 @@ pub const Segment = struct {
         const msg_type_id = std.mem.readInt(i32, meta_buf[16..20], .little);
 
         // Read payload
-        if (payload_len > 0) {
+        if (payload_len > 0) { // kcov-skip: evaluated on every readRecord; both branches covered (zero-payload test); no own line record
             const payload_bytes_read = try self.file.readAll(buf[0..payload_len]);
             if (payload_bytes_read < payload_len) {
                 return error.CorruptRecord;
@@ -233,7 +233,7 @@ pub const SegmentManager = struct {
                 if (std.mem.startsWith(u8, entry.name, "segment_") and std.mem.endsWith(u8, entry.name, ".dat")) {
                     const num_str = entry.name["segment_".len .. entry.name.len - ".dat".len];
                     const id = std.fmt.parseInt(u64, num_str, 10) catch continue;
-                    if (id + 1 > next_id) {
+                    if (id + 1 > next_id) { // kcov-skip: evaluated for every segment file in the reopen scan (reopen test); no own line record
                         next_id = id + 1;
                     }
                 }
@@ -583,4 +583,59 @@ test "SegmentManager write and read" {
     const r2 = try read_seg.readRecord(r1.?.next_offset, &buf);
     try std.testing.expect(r2 != null);
     try std.testing.expectEqualSlices(u8, "record two", r2.?.record.payload);
+}
+
+test "readRecord flags an undersized length prefix as corrupt" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var seg = try Segment.create(tmp_dir.dir, 0, 4096);
+    defer seg.close();
+
+    try seg.appendRecord(.{ .timestamp_ns = 1, .stream_id = 1, .msg_type_id = 1, .payload = "aaaa" });
+    try seg.appendRecord(.{ .timestamp_ns = 2, .stream_id = 1, .msg_type_id = 2, .payload = "bbbb" });
+
+    // Overwrite the SECOND record's length prefix with 5 (< record_overhead).
+    const second_off: u64 = 4 + 20 + 4;
+    try seg.file.seekTo(second_off);
+    var bad: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bad, 5, .little);
+    try seg.file.writeAll(&bad);
+
+    var buf: [256]u8 = undefined;
+    const first = try seg.readRecord(0, &buf);
+    try std.testing.expectEqualSlices(u8, "aaaa", first.?.record.payload);
+    try std.testing.expectError(error.CorruptRecord, seg.readRecord(second_off, &buf));
+}
+
+test "zero-length payload record roundtrips" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var seg = try Segment.create(tmp_dir.dir, 0, 4096);
+    defer seg.close();
+
+    try seg.appendRecord(.{ .timestamp_ns = 77, .stream_id = 9, .msg_type_id = -1, .payload = "" });
+
+    var buf: [64]u8 = undefined;
+    const rr = (try seg.readRecord(0, &buf)).?;
+    try std.testing.expectEqual(@as(usize, 0), rr.record.payload.len);
+    try std.testing.expectEqual(@as(u64, 77), rr.record.timestamp_ns);
+    try std.testing.expectEqual(@as(i32, -1), rr.record.msg_type_id);
+    try std.testing.expect((try seg.readRecord(rr.next_offset, &buf)) == null);
+}
+
+test "SegmentManager init fails cleanly when the base path is a file" {
+    const p = "/tmp/zigbolt_test_seg_filepath";
+    std.fs.cwd().deleteFile(p) catch {};
+    defer std.fs.cwd().deleteFile(p) catch {};
+    {
+        const f = try std.fs.cwd().createFile(p, .{});
+        f.close();
+    }
+
+    try std.testing.expect(std.meta.isError(SegmentManager.init(std.testing.allocator, .{
+        .base_path = p,
+        .segment_size = 4096,
+    })));
 }

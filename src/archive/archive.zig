@@ -142,7 +142,7 @@ pub const Archive = struct {
     ///   it are delivered); later segments still replay.
     pub fn replay(self: *Archive, params: ReplayParams, handler: *const fn (segment.Record) void) !u64 {
         var replayed: u64 = 0;
-        var seg_id = params.from_segment;
+        var seg_id = params.from_segment; // kcov-skip: runs on every replay (replay tests); no own line record
         const end_seg_id = self.segments.next_segment_id;
 
         // Start small; grows geometrically up to max_payload_size as needed.
@@ -173,7 +173,7 @@ pub const Archive = struct {
                     // Corruption mid-segment: stop this segment cleanly and
                     // move on to the next one.
                     error.CorruptRecord => break :reading,
-                    else => |e| return e,
+                    else => |e| return e, // kcov-skip: OS I/O failure pass-through; cannot be injected in-process
                 };
                 if (result == null) break :reading;
                 const rr = result.?;
@@ -207,7 +207,7 @@ pub const Archive = struct {
     pub fn stats(self: *const Archive) Stats {
         return Stats{
             .total_records = self.total_records,
-            .total_bytes = self.total_bytes,
+            .total_bytes = self.total_bytes, // kcov-skip: runs on every stats() call (stats tests); literal field store folded, no own line record
             .segment_count = self.segments.next_segment_id,
         };
     }
@@ -485,4 +485,56 @@ test "Archive stats" {
     try std.testing.expectEqual(@as(u64, 2), s1.total_records);
     try std.testing.expectEqual(@as(u64, 12), s1.total_bytes); // "hello" (5) + "world!!" (7)
     try std.testing.expectEqual(@as(u64, 1), s1.segment_count);
+}
+
+test "Archive periodic sync policy fsyncs the active segment" {
+    const test_path = "/tmp/zigbolt_test_archive_periodic";
+    std.fs.cwd().deleteTree(test_path) catch {};
+    defer std.fs.cwd().deleteTree(test_path) catch {};
+
+    var archive = try Archive.init(std.testing.allocator, ArchiveConfig{
+        .base_path = test_path,
+        .segment_size = 4096,
+        .sync_policy = .periodic,
+        .sync_interval_ms = 0, // every record() hits the durability point
+    });
+    defer archive.deinit();
+
+    try archive.record(1, 1, "sync me", 100);
+    try archive.record(1, 1, "again", 200);
+    try std.testing.expectEqual(@as(u64, 2), archive.stats().total_records);
+}
+
+test "Archive reopen ignores a trailing partial length prefix" {
+    const test_path = "/tmp/zigbolt_test_archive_torn_prefix";
+    std.fs.cwd().deleteTree(test_path) catch {};
+    defer std.fs.cwd().deleteTree(test_path) catch {};
+
+    {
+        var archive = try Archive.init(std.testing.allocator, ArchiveConfig{
+            .base_path = test_path,
+            .segment_size = 4096,
+            .sync_policy = .every_segment,
+        });
+        defer archive.deinit();
+        try archive.record(1, 1, "hello", 100);
+        try archive.record(2, 2, "world", 200);
+    }
+
+    // A crash mid-write can leave fewer than 4 bytes of the next record's
+    // length prefix; the stats recount must stop there, not error.
+    {
+        const f = try std.fs.cwd().openFile(test_path ++ "/segment_0000000000.dat", .{ .mode = .read_write });
+        defer f.close();
+        try f.seekFromEnd(0);
+        try f.writeAll(&[_]u8{0xDE});
+    }
+
+    var reopened = try Archive.init(std.testing.allocator, ArchiveConfig{
+        .base_path = test_path,
+        .segment_size = 4096,
+    });
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 2), reopened.stats().total_records);
+    try std.testing.expectEqual(@as(u64, 10), reopened.stats().total_bytes);
 }

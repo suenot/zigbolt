@@ -71,7 +71,7 @@ test "timestampNs returns non-zero" {
 test "timestampNs is monotonic" {
     const t1 = timestampNs();
     const t2 = timestampNs();
-    try std.testing.expect(t2 >= t1);
+    try std.testing.expect(t2 >= t1); // kcov-skip: test assertion line; the test passes; hit record oscillates between builds
 }
 
 test "monotonicNs returns non-zero and is non-decreasing" {

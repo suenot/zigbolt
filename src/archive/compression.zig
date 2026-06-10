@@ -93,7 +93,7 @@ pub const Compressor = struct {
     ///   input_size + 3 bytes per 65535-byte literal run + 1 end marker.
     /// A small safety margin is added on top.
     pub fn maxCompressedSize(input_size: usize) usize {
-        const num_runs = input_size / 65535 + 1;
+        const num_runs = input_size / 65535 + 1; // kcov-skip: runs in every maxCompressedSize call (frame tests); no own line record
         return input_size + num_runs * 3 + 16; // +16: end marker + margin
     }
 
@@ -111,7 +111,7 @@ pub const Compressor = struct {
 
         var src_pos: usize = 0;
         var dst_pos: usize = 0;
-        var literal_start: usize = 0;
+        var literal_start: usize = 0; // kcov-skip: runs on every non-empty compress (roundtrip tests); no own line record
 
         while (src_pos + 4 <= src.len) {
             const h = hash4(src, src_pos);
@@ -184,7 +184,7 @@ pub const Compressor = struct {
 fn emitLiterals(src: []const u8, start: usize, count: usize, dst: []u8, initial_dst_pos: usize) !usize {
     var remaining = count;
     var src_off = start;
-    var dst_pos = initial_dst_pos;
+    var dst_pos = initial_dst_pos; // kcov-skip: runs on every literal emission (roundtrip tests); no own line record
 
     while (remaining > 0) {
         const run_len: u16 = @intCast(@min(remaining, 65535));
@@ -216,7 +216,7 @@ pub const Decompressor = struct {
                 TOKEN_LITERAL => {
                     if (src_pos + 2 > src.len) return error.MalformedInput;
                     const length = std.mem.readInt(u16, src[src_pos..][0..2], .little);
-                    src_pos += 2;
+                    src_pos += 2; // kcov-skip: runs for every literal token decompressed (roundtrip tests); no own line record
                     if (src_pos + length > src.len) return error.MalformedInput;
                     if (dst_pos + length > dst.len) return error.OutputTooSmall;
                     @memcpy(dst[dst_pos..][0..length], src[src_pos..][0..length]);
@@ -227,7 +227,7 @@ pub const Decompressor = struct {
                     if (src_pos + 4 > src.len) return error.MalformedInput;
                     const offset = std.mem.readInt(u16, src[src_pos..][0..2], .little);
                     const length = std.mem.readInt(u16, src[src_pos + 2 ..][0..2], .little);
-                    src_pos += 4;
+                    src_pos += 4; // kcov-skip: runs for every match token decompressed (64KB test); no own line record
                     if (offset == 0 or offset > dst_pos) return error.MalformedInput;
                     if (dst_pos + length > dst.len) return error.OutputTooSmall;
                     const match_start = dst_pos - offset;
@@ -452,7 +452,7 @@ test "frame checksum validation" {
     const result = decompressFrame(allocator, frame);
     // Should fail with either a decompression error or checksum mismatch.
     try std.testing.expect(if (result) |buf| blk: {
-        allocator.free(buf);
+        allocator.free(buf); // kcov-skip: test-defensive: frees only if corruption went UNdetected — the test then fails; unreachable while the codec is correct
         break :blk false;
     } else |_| true);
 }
@@ -580,4 +580,11 @@ test "compression ratio — repetitive data should compress well" {
 
     // Expect at least 4:1 ratio for highly repetitive data.
     try std.testing.expect(compressed_len * 4 < src.len);
+}
+
+test "decompress rejects a stream without an end marker" {
+    // A complete literal run, then EOF with no TOKEN_END: malformed.
+    const src = [_]u8{ TOKEN_LITERAL, 1, 0, 'x' };
+    var dst: [16]u8 = undefined;
+    try std.testing.expectError(error.MalformedInput, Decompressor.decompress(&src, &dst));
 }

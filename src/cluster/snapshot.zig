@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Magic bytes: "ZBSP" (ZigBolt SnaPshot).
 const SNAPSHOT_MAGIC: u32 = 0x5A425350;
@@ -56,8 +57,11 @@ pub const SnapshotManager = struct {
         snapshot_interval: u64 = 10000,
     };
 
-    pub fn init(allocator: std.mem.Allocator, config: SnapshotConfig) SnapshotManager {
+    pub fn init(allocator: std.mem.Allocator, config: SnapshotConfig) !SnapshotManager {
         var path_buf: [256]u8 = undefined;
+        if (config.base_path.len > path_buf.len) {
+            return error.PathTooLong;
+        }
         const len: u16 = @intCast(config.base_path.len);
         @memcpy(path_buf[0..len], config.base_path);
 
@@ -85,17 +89,22 @@ pub const SnapshotManager = struct {
         self.entries_since_snapshot += 1;
     }
 
-    /// Write a snapshot to disk.
+    /// Write a snapshot to disk crash-safely.
     /// File name: snapshot_{last_index}.zbsp
+    ///
+    /// Atomic-write recipe: the snapshot is written to a `.tmp` file first,
+    /// fsync'd, then renamed over the final name, then the directory is
+    /// fsync'd. A crash at any point leaves either no snapshot (only a stale
+    /// `.tmp`, which load/cleanup ignore/remove) or a complete valid one —
+    /// never a torn `snapshot_N.zbsp`.
     pub fn takeSnapshot(self: *SnapshotManager, last_term: u64, last_index: u64, state_data: []const u8) !void {
-        // Format file name.
+        // Format final and temp file names.
         var name_buf: [128]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "snapshot_{d}.zbsp", .{last_index}) catch return error.NameTooLong;
+        var tmp_name_buf: [128]u8 = undefined;
+        const tmp_name = std.fmt.bufPrint(&tmp_name_buf, "snapshot_{d}.zbsp.tmp", .{last_index}) catch return error.NameTooLong;
 
-        // Build full path.
-        var full_path_buf: [512]u8 = undefined;
         const base = self.base_path[0..self.base_path_len];
-        const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ base, name }) catch return error.NameTooLong;
 
         // Build header.
         const state_size: u32 = @intCast(state_data.len);
@@ -112,15 +121,30 @@ pub const SnapshotManager = struct {
         hasher.update(state_data);
         const crc = hasher.final();
 
-        // Write the file.
-        const file = try std.fs.cwd().createFile(full_path, .{});
-        defer file.close();
+        var dir = try std.fs.cwd().openDir(base, .{});
+        defer dir.close();
 
-        try file.writeAll(&header);
-        if (state_data.len > 0) {
-            try file.writeAll(state_data);
+        // On any failure below, remove the temp file so it cannot linger.
+        errdefer dir.deleteFile(tmp_name) catch {};
+
+        // 1. Write the temp file and fsync it before rename.
+        {
+            const file = try dir.createFile(tmp_name, .{});
+            defer file.close();
+
+            try file.writeAll(&header);
+            if (state_data.len > 0) {
+                try file.writeAll(state_data);
+            }
+            try file.writeAll(std.mem.asBytes(&crc));
+            try file.sync();
         }
-        try file.writeAll(std.mem.asBytes(&crc));
+
+        // 2. Atomically publish the snapshot under its final name.
+        try dir.rename(tmp_name, name);
+
+        // 3. Make the rename itself durable.
+        try syncDir(dir);
 
         // Get file size for metadata.
         const file_size: u64 = HEADER_SIZE + state_data.len + CRC_SIZE;
@@ -135,7 +159,10 @@ pub const SnapshotManager = struct {
         };
     }
 
-    /// Load the latest snapshot from disk. Returns null if no snapshots exist.
+    /// Load the latest VALID snapshot from disk. Returns null if no snapshots exist.
+    /// Candidates are tried from newest (highest index) to oldest; corrupt or
+    /// torn files are skipped so a single bad write cannot brick recovery.
+    /// If snapshots exist but none validate, the newest candidate's error is returned.
     /// Caller owns the returned SnapshotData and must call deinit().
     pub fn loadLatestSnapshot(self: *SnapshotManager) !?SnapshotData {
         const base = self.base_path[0..self.base_path_len];
@@ -147,28 +174,48 @@ pub const SnapshotManager = struct {
         };
         defer dir.close();
 
-        var best_index: u64 = 0;
-        var best_name: [128]u8 = undefined;
-        var best_name_len: usize = 0;
+        var candidates = std.ArrayListUnmanaged(SnapshotFileEntry){};
+        defer candidates.deinit(self.allocator);
 
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
             if (entry.kind != .file) continue;
+            if (entry.name.len > 128) continue;
+            // `.tmp` files (torn writes) never parse as snapshots and are ignored.
             const idx = parseSnapshotIndex(entry.name) orelse continue;
-            if (idx > best_index) {
-                best_index = idx;
-                best_name_len = entry.name.len;
-                @memcpy(best_name[0..entry.name.len], entry.name);
-            }
+            var c: SnapshotFileEntry = .{ .index = idx, .name = undefined, .name_len = entry.name.len };
+            @memcpy(c.name[0..entry.name.len], entry.name);
+            try candidates.append(self.allocator, c);
         }
 
-        if (best_index == 0) return null;
+        if (candidates.items.len == 0) return null;
 
-        // Build full path.
-        var full_path_buf: [512]u8 = undefined;
-        const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ base, best_name[0..best_name_len] }) catch return error.NameTooLong;
+        // Sort by index descending: newest first.
+        std.mem.sort(SnapshotFileEntry, candidates.items, {}, struct {
+            fn newestFirst(_: void, a: SnapshotFileEntry, b: SnapshotFileEntry) bool {
+                return a.index > b.index;
+            }
+        }.newestFirst);
 
-        return try loadSnapshotFile(self.allocator, full_path);
+        var first_err: ?SnapshotValidationError = null;
+        for (candidates.items) |c| {
+            var full_path_buf: [512]u8 = undefined;
+            const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ base, c.name[0..c.name_len] }) catch return error.NameTooLong;
+
+            const snap = loadSnapshotFile(self.allocator, full_path) catch |err| switch (err) {
+                error.InvalidSnapshot, error.CrcMismatch, error.UnsupportedVersion, error.FileNotFound => |e| {
+                    // Corrupt/torn/vanished candidate — fall back to an older one.
+                    if (first_err == null) first_err = e;
+                    continue;
+                },
+                else => return err,
+            };
+            return snap;
+        }
+
+        // Snapshots exist but none validate: surface the newest one's error so
+        // the caller can distinguish "no snapshot" from "all snapshots corrupt".
+        return first_err.?;
     }
 
     /// Return metadata of the latest snapshot without loading state data.
@@ -176,7 +223,13 @@ pub const SnapshotManager = struct {
         return self.last_snapshot;
     }
 
-    /// Delete all but the N newest snapshot files.
+    /// Delete all but the N newest VALID snapshot files.
+    ///
+    /// Crash-safety rules:
+    /// - CRC-invalid (torn/corrupt) files never count toward `keep_count` and
+    ///   are deleted as garbage.
+    /// - The newest VALID snapshot is never deleted (keep_count is clamped to >= 1).
+    /// - Stale `.zbsp.tmp` files left by a crash mid-snapshot are removed.
     pub fn cleanOldSnapshots(self: *SnapshotManager, keep_count: usize) !void {
         const base = self.base_path[0..self.base_path_len];
 
@@ -186,42 +239,121 @@ pub const SnapshotManager = struct {
         };
         defer dir.close();
 
-        // Collect snapshot indices and names.
-        const Entry = struct {
-            index: u64,
-            name: [128]u8,
-            name_len: usize,
-        };
+        // Never delete the newest valid snapshot, even with keep_count == 0.
+        const keep = @max(keep_count, 1);
 
-        var entries = std.ArrayListUnmanaged(Entry){};
+        var entries = std.ArrayListUnmanaged(SnapshotFileEntry){};
         defer entries.deinit(self.allocator);
+        var stale_tmps = std.ArrayListUnmanaged(SnapshotFileEntry){};
+        defer stale_tmps.deinit(self.allocator);
 
         var iter = dir.iterate();
         while (try iter.next()) |de| {
             if (de.kind != .file) continue;
-            const idx = parseSnapshotIndex(de.name) orelse continue;
-            var e: Entry = .{ .index = idx, .name = undefined, .name_len = de.name.len };
+            if (de.name.len > 128) continue;
+            var e: SnapshotFileEntry = .{ .index = 0, .name = undefined, .name_len = de.name.len };
             @memcpy(e.name[0..de.name.len], de.name);
+            if (std.mem.endsWith(u8, de.name, ".zbsp.tmp")) {
+                // Torn write left behind by a crash mid-takeSnapshot.
+                try stale_tmps.append(self.allocator, e);
+                continue;
+            }
+            e.index = parseSnapshotIndex(de.name) orelse continue;
             try entries.append(self.allocator, e);
         }
 
-        if (entries.items.len <= keep_count) return;
-
-        // Sort by index ascending.
-        std.mem.sort(Entry, entries.items, {}, struct {
-            fn lessThan(_: void, a: Entry, b: Entry) bool {
-                return a.index < b.index;
-            }
-        }.lessThan);
-
-        // Delete all but the last keep_count.
-        const to_delete = entries.items.len - keep_count;
-        for (entries.items[0..to_delete]) |e| {
+        // Remove stale temp files (collected first; deleting during iteration
+        // can skip directory entries on some filesystems).
+        for (stale_tmps.items) |e| {
             dir.deleteFile(e.name[0..e.name_len]) catch {};
+        }
+
+        // Sort by index descending: newest first.
+        std.mem.sort(SnapshotFileEntry, entries.items, {}, struct {
+            fn newestFirst(_: void, a: SnapshotFileEntry, b: SnapshotFileEntry) bool {
+                return a.index > b.index;
+            }
+        }.newestFirst);
+
+        // Keep the newest `keep` snapshots that validate; delete everything
+        // else (older valid ones beyond `keep`, and all corrupt ones).
+        var kept: usize = 0;
+        for (entries.items) |e| {
+            const name = e.name[0..e.name_len];
+            if (kept < keep and validateSnapshotFile(dir, name)) {
+                kept += 1;
+            } else {
+                dir.deleteFile(name) catch {};
+            }
         }
     }
 
     // ── Internal helpers ─────────────────────────────────────
+
+    /// Directory entry for a snapshot candidate file.
+    const SnapshotFileEntry = struct {
+        index: u64,
+        name: [128]u8,
+        name_len: usize,
+    };
+
+    /// Errors that mean "this particular snapshot file is unusable" (as
+    /// opposed to environmental errors like OutOfMemory that must propagate).
+    const SnapshotValidationError = error{
+        InvalidSnapshot,
+        CrcMismatch,
+        UnsupportedVersion,
+        FileNotFound,
+    };
+
+    /// Fsync a directory handle so a completed rename/unlink in it is durable.
+    /// No-op on Windows where directory handles cannot be flushed.
+    fn syncDir(dir: std.fs.Dir) !void {
+        if (builtin.os.tag == .windows) return;
+        try std.posix.fsync(dir.fd);
+    }
+
+    /// Streaming validation of a snapshot file (header + size + CRC) without
+    /// allocating the state payload. Returns false for any torn/corrupt file.
+    fn validateSnapshotFile(dir: std.fs.Dir, name: []const u8) bool {
+        const file = dir.openFile(name, .{}) catch return false;
+        defer file.close();
+
+        const file_size = file.getEndPos() catch return false;
+        if (file_size < HEADER_SIZE + CRC_SIZE) return false;
+
+        var header: [HEADER_SIZE]u8 = undefined;
+        const header_read = file.readAll(&header) catch return false;
+        if (header_read < HEADER_SIZE) return false;
+
+        const magic = std.mem.bytesToValue(u32, header[0..4]);
+        if (magic != SNAPSHOT_MAGIC) return false;
+        const version = std.mem.bytesToValue(u16, header[4..6]);
+        if (version != SNAPSHOT_VERSION) return false;
+
+        const state_size = std.mem.bytesToValue(u32, header[22..26]);
+        if (state_size != file_size - HEADER_SIZE - CRC_SIZE) return false;
+
+        var hasher = std.hash.Crc32.init();
+        hasher.update(&header);
+
+        var remaining: u64 = state_size;
+        var chunk: [4096]u8 = undefined;
+        while (remaining > 0) {
+            const want: usize = @intCast(@min(remaining, chunk.len));
+            const got = file.readAll(chunk[0..want]) catch return false;
+            if (got < want) return false;
+            hasher.update(chunk[0..want]);
+            remaining -= want;
+        }
+
+        var crc_buf: [CRC_SIZE]u8 = undefined;
+        const crc_read = file.readAll(&crc_buf) catch return false;
+        if (crc_read < CRC_SIZE) return false;
+        const stored_crc = std.mem.bytesToValue(u32, &crc_buf);
+
+        return stored_crc == hasher.final();
+    }
 
     /// Parse "snapshot_{index}.zbsp" and return the index, or null.
     fn parseSnapshotIndex(name: []const u8) ?u64 {
@@ -255,6 +387,12 @@ pub const SnapshotManager = struct {
         const last_term = std.mem.bytesToValue(u64, header[6..14]);
         const last_index = std.mem.bytesToValue(u64, header[14..22]);
         const state_size = std.mem.bytesToValue(u32, header[22..26]);
+
+        // Cap the untrusted state_size against the actual file size BEFORE
+        // allocating, so a corrupt header cannot trigger a multi-GB alloc.
+        const file_size = try file.getEndPos();
+        if (file_size < HEADER_SIZE + CRC_SIZE) return error.InvalidSnapshot;
+        if (state_size > file_size - HEADER_SIZE - CRC_SIZE) return error.InvalidSnapshot;
 
         // Read state data.
         const data = try allocator.alloc(u8, state_size);
@@ -315,7 +453,7 @@ test "Snapshot: takeSnapshot creates file with correct format" {
     try ensureTestDir();
     defer cleanTestDir();
 
-    var mgr = SnapshotManager.init(testing.allocator, .{
+    var mgr = try SnapshotManager.init(testing.allocator, .{
         .base_path = TEST_DIR,
         .snapshot_interval = 100,
     });
@@ -362,7 +500,7 @@ test "Snapshot: loadLatestSnapshot reads back correctly" {
     try ensureTestDir();
     defer cleanTestDir();
 
-    var mgr = SnapshotManager.init(testing.allocator, .{
+    var mgr = try SnapshotManager.init(testing.allocator, .{
         .base_path = TEST_DIR,
         .snapshot_interval = 100,
     });
@@ -384,7 +522,7 @@ test "Snapshot: CRC32 validation on corrupt snapshot" {
     try ensureTestDir();
     defer cleanTestDir();
 
-    var mgr = SnapshotManager.init(testing.allocator, .{
+    var mgr = try SnapshotManager.init(testing.allocator, .{
         .base_path = TEST_DIR,
         .snapshot_interval = 100,
     });
@@ -410,7 +548,7 @@ test "Snapshot: CRC32 validation on corrupt snapshot" {
 }
 
 test "Snapshot: shouldSnapshot triggers after interval" {
-    var mgr = SnapshotManager.init(testing.allocator, .{
+    var mgr = try SnapshotManager.init(testing.allocator, .{
         .base_path = ".",
         .snapshot_interval = 5,
     });
@@ -436,7 +574,7 @@ test "Snapshot: multiple snapshots — loadLatest returns newest" {
     try ensureTestDir();
     defer cleanTestDir();
 
-    var mgr = SnapshotManager.init(testing.allocator, .{
+    var mgr = try SnapshotManager.init(testing.allocator, .{
         .base_path = TEST_DIR,
         .snapshot_interval = 100,
     });
@@ -460,7 +598,7 @@ test "Snapshot: cleanOldSnapshots keeps only N newest" {
     try ensureTestDir();
     defer cleanTestDir();
 
-    var mgr = SnapshotManager.init(testing.allocator, .{
+    var mgr = try SnapshotManager.init(testing.allocator, .{
         .base_path = TEST_DIR,
         .snapshot_interval = 100,
     });
@@ -497,7 +635,7 @@ test "Snapshot: empty directory — loadLatest returns null" {
     try ensureTestDir();
     defer cleanTestDir();
 
-    var mgr = SnapshotManager.init(testing.allocator, .{
+    var mgr = try SnapshotManager.init(testing.allocator, .{
         .base_path = TEST_DIR,
         .snapshot_interval = 100,
     });
@@ -507,12 +645,154 @@ test "Snapshot: empty directory — loadLatest returns null" {
     try testing.expect(result == null);
 }
 
+test "Snapshot: corrupt newest falls back to older valid snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &path_buf);
+
+    var mgr = try SnapshotManager.init(testing.allocator, .{
+        .base_path = base,
+        .snapshot_interval = 100,
+    });
+    defer mgr.deinit();
+
+    try mgr.takeSnapshot(1, 10, "state at 10");
+    try mgr.takeSnapshot(2, 20, "state at 20");
+
+    // Simulate a torn/bit-rotted newest snapshot: flip a CRC byte on disk.
+    {
+        const f = try tmp.dir.openFile("snapshot_20.zbsp", .{ .mode = .read_write });
+        defer f.close();
+        const size = try f.getEndPos();
+        var byte: [1]u8 = undefined;
+        _ = try f.preadAll(&byte, size - 1);
+        byte[0] ^= 0xFF;
+        try f.seekTo(size - 1);
+        try f.writeAll(&byte);
+    }
+
+    // Recovery must fall back to the older VALID snapshot, not error out.
+    var snap = (try mgr.loadLatestSnapshot()).?;
+    defer snap.deinit();
+    try testing.expectEqual(@as(u64, 1), snap.last_included_term);
+    try testing.expectEqual(@as(u64, 10), snap.last_included_index);
+    try testing.expectEqualStrings("state at 10", snap.data);
+}
+
+test "Snapshot: stale .tmp from torn write is ignored by load and removed by cleanup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &path_buf);
+
+    var mgr = try SnapshotManager.init(testing.allocator, .{
+        .base_path = base,
+        .snapshot_interval = 100,
+    });
+    defer mgr.deinit();
+
+    try mgr.takeSnapshot(1, 10, "good state");
+
+    // Simulate a crash mid-takeSnapshot: only a partial temp file for index 99.
+    try tmp.dir.writeFile(.{ .sub_path = "snapshot_99.zbsp.tmp", .data = "torn partial write" });
+
+    // Load is unaffected by the temp file.
+    var snap = (try mgr.loadLatestSnapshot()).?;
+    defer snap.deinit();
+    try testing.expectEqual(@as(u64, 10), snap.last_included_index);
+    try testing.expectEqualStrings("good state", snap.data);
+
+    // Cleanup removes the stale temp and keeps the valid snapshot.
+    try mgr.cleanOldSnapshots(1);
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile("snapshot_99.zbsp.tmp", .{}));
+    const f = try tmp.dir.openFile("snapshot_10.zbsp", .{});
+    f.close();
+}
+
+test "Snapshot: cleanOldSnapshots keeps newest VALID, deletes the corrupt one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &path_buf);
+
+    var mgr = try SnapshotManager.init(testing.allocator, .{
+        .base_path = base,
+        .snapshot_interval = 100,
+    });
+    defer mgr.deinit();
+
+    try mgr.takeSnapshot(1, 10, "good old");
+    try mgr.takeSnapshot(2, 20, "torn new");
+
+    // Corrupt the newest snapshot on disk.
+    {
+        const f = try tmp.dir.openFile("snapshot_20.zbsp", .{ .mode = .read_write });
+        defer f.close();
+        const size = try f.getEndPos();
+        var byte: [1]u8 = undefined;
+        _ = try f.preadAll(&byte, size - 1);
+        byte[0] ^= 0xFF;
+        try f.seekTo(size - 1);
+        try f.writeAll(&byte);
+    }
+
+    // keep_count=1 must keep snapshot_10 (newest VALID), not snapshot_20 (corrupt).
+    try mgr.cleanOldSnapshots(1);
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile("snapshot_20.zbsp", .{}));
+    {
+        const f = try tmp.dir.openFile("snapshot_10.zbsp", .{});
+        f.close();
+    }
+
+    var snap = (try mgr.loadLatestSnapshot()).?;
+    defer snap.deinit();
+    try testing.expectEqualStrings("good old", snap.data);
+}
+
+test "Snapshot: corrupt state_size is rejected without huge allocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &path_buf);
+
+    var mgr = try SnapshotManager.init(testing.allocator, .{
+        .base_path = base,
+        .snapshot_interval = 100,
+    });
+    defer mgr.deinit();
+
+    // Craft a snapshot whose header claims ~4GB of state but holds 4 bytes.
+    const term: u64 = 1;
+    const index: u64 = 5;
+    const huge_size: u32 = 0xFFFF_FFF0;
+    var file_data: [HEADER_SIZE + 4]u8 = undefined;
+    @memcpy(file_data[0..4], std.mem.asBytes(&SNAPSHOT_MAGIC));
+    @memcpy(file_data[4..6], std.mem.asBytes(&SNAPSHOT_VERSION));
+    @memcpy(file_data[6..14], std.mem.asBytes(&term));
+    @memcpy(file_data[14..22], std.mem.asBytes(&index));
+    @memcpy(file_data[22..26], std.mem.asBytes(&huge_size));
+    @memset(file_data[HEADER_SIZE..], 0xAB);
+    try tmp.dir.writeFile(.{ .sub_path = "snapshot_5.zbsp", .data = &file_data });
+
+    // The size cap rejects it before any allocation can happen; since it is
+    // the only candidate, the validation error surfaces to the caller.
+    try testing.expectError(error.InvalidSnapshot, mgr.loadLatestSnapshot());
+}
+
+test "Snapshot: init rejects overlong base path" {
+    const long_path = "x" ** 300;
+    try testing.expectError(error.PathTooLong, SnapshotManager.init(testing.allocator, .{
+        .base_path = long_path,
+    }));
+}
+
 test "Snapshot: large state data (64KB)" {
     cleanTestDir();
     try ensureTestDir();
     defer cleanTestDir();
 
-    var mgr = SnapshotManager.init(testing.allocator, .{
+    var mgr = try SnapshotManager.init(testing.allocator, .{
         .base_path = TEST_DIR,
         .snapshot_interval = 100,
     });

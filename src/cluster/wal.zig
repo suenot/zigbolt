@@ -1,4 +1,17 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Fsync the directory containing `file_path` so renames/unlinks of entries
+/// in it are durable. No-op on Windows where directory handles cannot be
+/// flushed; on macOS plain fsync is used (F_FULLFSYNC would be stronger but
+/// plain fsync is the portable baseline).
+fn syncParentDir(file_path: []const u8) !void {
+    if (builtin.os.tag == .windows) return;
+    const dir_path = std.fs.path.dirname(file_path) orelse ".";
+    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    defer dir.close();
+    try std.posix.fsync(dir.fd);
+}
 
 /// Write-Ahead Log entry returned to callers.
 pub const WalEntry = struct {
@@ -45,12 +58,19 @@ pub const WriteAheadLog = struct {
         term: u64,
     };
 
+    /// Durability contract: an entry is only durable after `file.sync()` has
+    /// run past it. A Raft node MUST NOT acknowledge (reply to AppendEntries /
+    /// grant a vote referencing) an entry until it is durable — use
+    /// `.every_entry`, or batch appends and call `sync()` before replying.
     pub const SyncPolicy = enum {
-        /// fsync after every entry (safest, slowest).
+        /// fsync after every entry (safest, slowest). Use this — or an
+        /// explicit `sync()` before acking — for the Raft consensus path.
         every_entry,
-        /// fsync after N entries.
+        /// fsync after N entries. NOT sufficient alone for Raft acks: entries
+        /// between syncs sit in the page cache and are lost on power failure.
         every_n_entries,
-        /// fsync only on explicit flush.
+        /// fsync only on explicit `sync()`/`flush()`. The caller owns the
+        /// persist-before-reply ordering.
         explicit,
     };
 
@@ -68,6 +88,9 @@ pub const WriteAheadLog = struct {
     /// Create or open a WAL file. Does NOT run recovery; call `recover()` after init.
     pub fn init(allocator: std.mem.Allocator, config: WalConfig) !WriteAheadLog {
         var path_buf: [256]u8 = undefined;
+        if (config.path.len > path_buf.len) {
+            return error.PathTooLong;
+        }
         const len: u16 = @intCast(config.path.len);
         @memcpy(path_buf[0..len], config.path);
 
@@ -76,9 +99,11 @@ pub const WriteAheadLog = struct {
             .read = true,
             .truncate = false,
         }) catch |err| return err;
+        errdefer file.close();
 
-        // Seek to end to get write position.
-        const end_pos = file.getEndPos() catch 0;
+        // Seek to end to get write position. Surface the error: silently
+        // assuming position 0 would overwrite existing records.
+        const end_pos = try file.getEndPos();
 
         return .{
             .file = file,
@@ -149,7 +174,10 @@ pub const WriteAheadLog = struct {
         // Apply sync policy.
         self.entries_since_sync += 1;
         switch (self.sync_policy) {
-            .every_entry => try self.file.sync(),
+            .every_entry => {
+                try self.file.sync();
+                self.entries_since_sync = 0;
+            },
             .every_n_entries => {
                 if (self.entries_since_sync >= self.sync_interval) {
                     try self.file.sync();
@@ -185,8 +213,12 @@ pub const WriteAheadLog = struct {
         }
 
         if (truncate_offset) |offset| {
-            // Truncate the file.
+            // Truncate the file and make the truncation durable immediately:
+            // a crash after an un-fsynced ftruncate would resurrect the
+            // conflicting (truncated) entries on recovery.
             try self.file.setEndPos(offset);
+            try self.file.sync();
+            try syncParentDir(self.path[0..self.path_len]);
             self.write_pos = offset;
 
             // Shrink the in-memory index.
@@ -295,7 +327,11 @@ pub const WriteAheadLog = struct {
 
         // Set write position to end of last valid record (truncate any partial data).
         self.write_pos = pos;
-        try self.file.setEndPos(pos);
+        if (pos < file_size) {
+            try self.file.setEndPos(pos);
+            // Make the corrupt-tail truncation durable.
+            try self.file.sync();
+        }
 
         return entries.toOwnedSlice(self.allocator) catch |err| {
             // On allocation failure, free everything.
@@ -307,10 +343,17 @@ pub const WriteAheadLog = struct {
         };
     }
 
-    /// Force an fsync to disk.
-    pub fn flush(self: *WriteAheadLog) !void {
+    /// Force an fsync to disk. A Raft caller MUST invoke this (or use
+    /// `.every_entry`) before acknowledging appended entries to a leader —
+    /// persist-before-reply is required for Raft safety.
+    pub fn sync(self: *WriteAheadLog) !void {
         try self.file.sync();
         self.entries_since_sync = 0;
+    }
+
+    /// Alias of `sync()` kept for existing callers.
+    pub fn flush(self: *WriteAheadLog) !void {
+        try self.sync();
     }
 
     /// Return the last written log index, or 0 if empty.
@@ -351,6 +394,13 @@ pub const WriteAheadLog = struct {
         if (record_length < 20) return error.InvalidRecord;
         const payload_len: usize = @intCast(record_length - 20);
 
+        // Cap the untrusted record length against the actual file size BEFORE
+        // allocating, so a corrupt header cannot trigger a multi-GB alloc.
+        const file_size = try self.file.getEndPos();
+        if (file_offset + HEADER_SIZE + payload_len + CRC_SIZE > file_size) {
+            return error.InvalidRecord;
+        }
+
         // Read payload.
         const data = try self.allocator.alloc(u8, payload_len);
         errdefer self.allocator.free(data);
@@ -386,29 +436,58 @@ pub const WriteAheadLog = struct {
 };
 
 /// Persistent Raft vote state (current_term + voted_for).
-/// Stored as a fixed-size 16-byte file.
+/// Stored as a fixed-size 16-byte file:
+///   [u64 current_term][u32 voted_for][u32 crc32 over the first 12 bytes]
+///
+/// Durability matters here more than anywhere else: losing a granted vote and
+/// restarting as "never voted" lets a node vote twice in the same term, which
+/// can elect two leaders. save() is therefore atomic (temp + fsync + rename +
+/// dir fsync) and load() treats a short/corrupt file as a FATAL error — the
+/// caller must refuse to start rather than risk a double vote.
 pub const VoteState = struct {
     current_term: u64,
     voted_for: ?u32,
 
     pub const FILE_SIZE: usize = 16;
 
-    /// Save vote state to a file atomically.
+    /// Save vote state to a file atomically and durably:
+    /// write `path.tmp`, fsync it, rename over `path`, fsync the directory.
+    /// A crash at any point leaves either the old vote record or the new one —
+    /// never a torn or missing file.
     pub fn save(self: VoteState, path: []const u8) !void {
         var buf: [FILE_SIZE]u8 = undefined;
         @memcpy(buf[0..8], std.mem.asBytes(&self.current_term));
         const vf: u32 = self.voted_for orelse 0xFFFFFFFF;
         @memcpy(buf[8..12], std.mem.asBytes(&vf));
-        // 4 bytes padding (zeroed).
-        @memset(buf[12..16], 0);
+        const crc = std.hash.Crc32.hash(buf[0..12]);
+        @memcpy(buf[12..16], std.mem.asBytes(&crc));
 
-        try std.fs.cwd().writeFile(.{
-            .sub_path = path,
-            .data = &buf,
-        });
+        var tmp_path_buf: [512]u8 = undefined;
+        const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path}) catch return error.PathTooLong;
+
+        // On any failure below, remove the temp file so it cannot linger.
+        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+        // 1. Write the temp file and fsync it before rename.
+        {
+            const file = try std.fs.cwd().createFile(tmp_path, .{});
+            defer file.close();
+            try file.writeAll(&buf);
+            try file.sync();
+        }
+
+        // 2. Atomically replace the previous vote record.
+        try std.fs.cwd().rename(tmp_path, path);
+
+        // 3. Make the rename itself durable.
+        try syncParentDir(path);
     }
 
-    /// Load vote state from a file. Returns null if file does not exist.
+    /// Load vote state from a file.
+    /// Returns null ONLY if the file does not exist (genuinely never voted).
+    /// A short or CRC-invalid file returns error.CorruptVoteState: the caller
+    /// MUST treat this as fatal and refuse to start, otherwise a node that
+    /// already granted a vote could vote again in the same term.
     pub fn load(path: []const u8) !?VoteState {
         const file = std.fs.cwd().openFile(path, .{}) catch |err| {
             if (err == error.FileNotFound) return null;
@@ -418,7 +497,11 @@ pub const VoteState = struct {
 
         var buf: [FILE_SIZE]u8 = undefined;
         const n = try file.readAll(&buf);
-        if (n < FILE_SIZE) return null;
+        if (n < FILE_SIZE) return error.CorruptVoteState;
+
+        const stored_crc = std.mem.bytesToValue(u32, buf[12..16]);
+        const computed_crc = std.hash.Crc32.hash(buf[0..12]);
+        if (stored_crc != computed_crc) return error.CorruptVoteState;
 
         const current_term = std.mem.bytesToValue(u64, buf[0..8]);
         const vf_raw = std.mem.bytesToValue(u32, buf[8..12]);
@@ -733,6 +816,152 @@ test "WAL: append after recovery (continue from last index)" {
         defer testing.allocator.free(e3.data);
         try testing.expectEqualStrings("three", e3.data);
     }
+}
+
+test "WAL: VoteState truncated or corrupt file is an error, not 'no vote'" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/vote.state", .{dir_path});
+
+    const vs = VoteState{ .current_term = 7, .voted_for = 3 };
+    try vs.save(path);
+
+    // Atomic save leaves no temp file behind.
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile("vote.state.tmp", .{}));
+
+    // Round-trip is intact (CRC verifies).
+    const loaded = (try VoteState.load(path)).?;
+    try testing.expectEqual(@as(u64, 7), loaded.current_term);
+    try testing.expectEqual(@as(u32, 3), loaded.voted_for.?);
+
+    // A truncated vote file (torn write) must be a hard ERROR — silently
+    // treating it as "never voted" would allow a double vote after restart.
+    {
+        const f = try tmp.dir.openFile("vote.state", .{ .mode = .read_write });
+        defer f.close();
+        try f.setEndPos(10);
+    }
+    try testing.expectError(error.CorruptVoteState, VoteState.load(path));
+
+    // Restore, then corrupt a payload byte: the CRC must catch it.
+    try vs.save(path);
+    {
+        const f = try tmp.dir.openFile("vote.state", .{ .mode = .read_write });
+        defer f.close();
+        var byte: [1]u8 = undefined;
+        _ = try f.preadAll(&byte, 3);
+        byte[0] ^= 0xFF;
+        try f.seekTo(3);
+        try f.writeAll(&byte);
+    }
+    try testing.expectError(error.CorruptVoteState, VoteState.load(path));
+}
+
+test "WAL: sync() makes appended bytes durable before ack" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/sync_ack.wal", .{dir_path});
+
+    var wal = try WriteAheadLog.init(testing.allocator, .{
+        .path = path,
+        .sync_policy = .explicit,
+    });
+    defer wal.deinit();
+
+    // Raft persist-before-reply: append, then sync() BEFORE acking the leader.
+    try wal.append(1, 1, "hello");
+    try wal.sync();
+    try testing.expectEqual(@as(u32, 0), wal.entries_since_sync);
+
+    // The full record (20-byte header + 5 payload + 4 CRC) is in the file.
+    const f = try tmp.dir.openFile("sync_ack.wal", .{});
+    defer f.close();
+    try testing.expectEqual(@as(u64, 29), try f.getEndPos());
+}
+
+test "WAL: truncateFrom is durable — truncated entries do not resurrect on recovery" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/trunc_durable.wal", .{dir_path});
+
+    // Append 5 entries, then resolve a Raft conflict by truncating from 3.
+    {
+        var wal = try WriteAheadLog.init(testing.allocator, .{
+            .path = path,
+            .sync_policy = .every_entry,
+        });
+        defer wal.deinit();
+
+        try wal.append(1, 1, "a");
+        try wal.append(1, 2, "b");
+        try wal.append(2, 3, "c");
+        try wal.append(2, 4, "d");
+        try wal.append(3, 5, "e");
+        try wal.truncateFrom(3);
+    }
+
+    // Simulated restart: the conflicting entries 3..5 must NOT come back.
+    {
+        var wal = try WriteAheadLog.init(testing.allocator, .{
+            .path = path,
+            .sync_policy = .every_entry,
+        });
+        defer wal.deinit();
+
+        const entries = try wal.recover();
+        defer freeWalEntries(testing.allocator, entries);
+
+        try testing.expectEqual(@as(usize, 2), entries.len);
+        try testing.expectEqual(@as(u64, 2), wal.lastIndex());
+        try testing.expectEqualStrings("a", entries[0].data);
+        try testing.expectEqualStrings("b", entries[1].data);
+        try testing.expect((try wal.readEntry(3)) == null);
+    }
+}
+
+test "WAL: corrupt record_length is rejected without huge allocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/corrupt_len.wal", .{dir_path});
+
+    var wal = try WriteAheadLog.init(testing.allocator, .{
+        .path = path,
+        .sync_policy = .every_entry,
+    });
+    defer wal.deinit();
+
+    try wal.append(1, 1, "x");
+
+    // Corrupt the length field of the record at offset 0 to claim ~4GB.
+    {
+        const f = try tmp.dir.openFile("corrupt_len.wal", .{ .mode = .read_write });
+        defer f.close();
+        const huge: u32 = 0xFFFF_FF00;
+        try f.seekTo(0);
+        try f.writeAll(std.mem.asBytes(&huge));
+    }
+
+    // The size cap rejects the record before any allocation can happen.
+    try testing.expectError(error.InvalidRecord, wal.readEntry(1));
+}
+
+test "WAL: init rejects overlong path" {
+    const long_path = "x" ** 300;
+    try testing.expectError(error.PathTooLong, WriteAheadLog.init(testing.allocator, .{
+        .path = long_path,
+    }));
 }
 
 test "WAL: large payload entry" {

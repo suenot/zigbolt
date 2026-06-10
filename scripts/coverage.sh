@@ -21,8 +21,11 @@ docker run --rm --platform linux/arm64 \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     -v "$ROOT:$ROOT" -w "$ROOT" --tmpfs /tmp:exec,size=512m \
     zigbolt-kcov sh -c "
-        kcov --include-pattern=$ROOT/src/ coverage/root zig-out/tests/root_tests >/dev/null 2>&1
-        kcov --include-pattern=$ROOT/src/ coverage/ffi zig-out/tests/ffi_tests >/dev/null 2>&1
+        # kcov-skip: marker for lines that are provably untestable in-process
+        # (defensive unreachable/panic guards, OS-failure branches that cannot
+        # be injected). Use sparingly and always with an inline justification.
+        kcov --include-pattern=$ROOT/src/ --exclude-line='kcov-skip' coverage/root zig-out/tests/root_tests >/dev/null 2>&1
+        kcov --include-pattern=$ROOT/src/ --exclude-line='kcov-skip' coverage/ffi zig-out/tests/ffi_tests >/dev/null 2>&1
         kcov --merge coverage/merged coverage/root coverage/ffi >/dev/null 2>&1
     "
 

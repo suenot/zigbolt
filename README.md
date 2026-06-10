@@ -9,29 +9,63 @@ runtime overhead.
 
 ## Features
 
-- **Sub-100ns IPC latency** -- shared memory channels with cache-line-padded atomics
+- **Shared-memory IPC** -- cache-line-padded atomics, designed for sub-200ns p50 round trips (design target -- run the bundled benchmarks on your hardware)
 - **Zero-copy** -- messages decoded in-place via pointer cast, no serialization overhead
 - **Comptime wire codecs** -- `WireCodec(T)` validates packed structs at compile time
 - **SBE codec** -- FIX-standard Simple Binary Encoding with groups, vardata, and comptime schemas
-- **FIX/SBE messages** -- NewOrderSingle, ExecutionReport, MarketDataIncrementalRefresh, MassQuote, Heartbeat, Logon
+- **FIX/SBE messages** -- NewOrderSingle, ExecutionReport, MarketDataIncrementalRefresh, MassQuote, Heartbeat, Logon -- with checked decoders that validate untrusted wire bytes (lengths, group extents, enum values)
 - **Wire protocol flyweights** -- Aeron-compatible DataHeader, StatusMessage, NAK, Setup, RTT, Error frames
-- **Lock-free ring buffers** -- SPSC (acquire/release atomics) and MPSC (CAS two-phase commit)
+- **Lock-free ring buffers** -- SPSC (acquire/release atomics) and MPSC (CAS two-phase commit), memory-safe with back-pressure (no use-after-release)
 - **Broadcast buffer** -- 1-to-N fan-out for market data (one producer, many consumers, lossy)
-- **NAK-based reliability** -- receiver-driven retransmission with gap detection bitmap
+- **NAK-based reliability** -- receiver-driven retransmission with de-duplication, a sliding NAK window, and flow-control credits
 - **AIMD congestion control** -- TCP-like slow start / congestion avoidance with RTT estimation
 - **Flow control strategies** -- Min (reliable multicast), Max (best-effort), Tagged (group-based)
-- **Fragmentation/reassembly** -- transparent large-message support over UDP
+- **Fragmentation/reassembly** -- transparent large-message support over UDP, wired end-to-end in `NetworkChannel`
+- **Hardened against untrusted input** -- the IPC shared-memory header is bounds-checked on open/poll, and the UDP/wire parsers reject malformed datagrams instead of panicking or reading out of bounds
 - **Idle strategies** -- BusySpin, Yielding, Sleeping, Backoff for adaptive CPU/latency trade-offs
 - **Agent pattern** -- composable threaded agents with lifecycle management and duty cycle tracking
 - **Shared counters** -- atomic counter system for monitoring all subsystems (IPC, network, cluster, etc.)
-- **Raft consensus cluster** -- leader election, log replication, state machine application
+- **Raft consensus cluster** (*experimental*) -- leader election, log replication, state machine application, with durable persistence (WAL + persisted vote/term + atomic snapshots + crash recovery); see [Status](#status) for current limitations
 - **Write-ahead log** -- CRC32-validated persistent WAL with crash recovery and truncation
 - **Raft snapshots** -- point-in-time state snapshots with CRC validation and cleanup
 - **Total-order sequencer** -- monotonic sequence assignment across multiple input streams
-- **Message archive** -- segment-based record/replay with stream filtering
+- **Message archive** -- segment-based record/replay with per-record CRC32 and configurable fsync
 - **Archive catalog & index** -- segment metadata catalog with time/stream queries and sparse index
-- **LZ4-style compression** -- hash-table-based compression for archive segments
-- **C/Rust/Python FFI** -- shared library with C-ABI exports
+- **LZ4-style compression** -- standalone compression utility (not yet wired into the archive write path)
+- **Five language bindings** -- C, Rust, Python, Go, and TypeScript bindings over the C-ABI shared library; all five build and pass smoke tests against the real library
+
+## Status
+
+ZigBolt is a young project. What is verified today:
+
+- **423 tests pass** via `zig build test`, in both Debug and ReleaseFast builds.
+- **The C-ABI shared library builds by default**: `zig build` produces
+  `zig-out/lib/libzigbolt.{dylib,so}` and `libzigbolt.a` with all 10 exports.
+- **All five language bindings** (C, Rust, Python, Go, TypeScript) build and
+  pass smoke tests against the shared library, reporting version 0.2.1.
+- **Memory-safety hardening**: the IPC layer treats the shared-memory header as
+  untrusted (bounds-checked, no out-of-bounds access); the SPSC/MPSC ring
+  buffers and broadcast buffer are memory-safe with back-pressure; the
+  UDP/wire parsers (FIX/SBE, flyweights, `WireCodec`) validate untrusted input
+  -- checked enums and bounded group counts, so a malicious datagram cannot
+  cause out-of-bounds reads or panics.
+- **Reliability works end-to-end**: de-duplication, sliding NAK window,
+  flow-control credits, and fragmentation/reassembly.
+
+Known limitations:
+
+- **Raft is experimental and not yet production-validated.** In-memory safety
+  is in place (only committed entries are applied; vote/response handling is
+  term-validated; single-node election works) and durable persistence is wired
+  in (write-ahead log, persisted vote/term, atomic snapshots, crash recovery
+  on restart). However there are **no built-in election timers or transport
+  loop** (liveness is the embedder's responsibility), no log compaction /
+  InstallSnapshot / membership changes, and it has **not** been validated with
+  real multi-process fault injection.
+- **Performance numbers are design targets, not measured results.** Benchmarks
+  are bundled (`zig build bench`) so you can measure on your own hardware.
+- **Archive compression** (`compression.zig`) is a standalone utility and is
+  not yet wired into the archive write path.
 
 ## Architecture
 
@@ -97,7 +131,12 @@ zig build
 zig build test
 ```
 
-Runs the full unit test suite (423 tests, including the FFI surface).
+Runs the full unit test suite (423 tests, including the FFI surface). The
+suite passes in both Debug and ReleaseFast builds:
+
+```bash
+zig build test -Doptimize=ReleaseFast
+```
 
 ### Run Benchmarks
 
@@ -140,8 +179,8 @@ zig build && ./zig-out/bin/bench_udp_rtt
 | **SparseIndex** | `src/archive/index.zig` | Sparse index for fast record lookup within segments |
 | **Compressor** | `src/archive/compression.zig` | LZ4-style compression/decompression with framed format |
 | **Sequencer** | `src/sequencer/sequencer.zig` | Atomic total-order sequence assignment |
-| **RaftNode** | `src/cluster/raft.zig` | Raft consensus: election, replication, commit |
-| **Cluster** | `src/cluster/cluster.zig` | High-level Raft cluster with state machine |
+| **RaftNode** | `src/cluster/raft.zig` | Raft consensus: election, replication, commit (*experimental*) |
+| **Cluster** | `src/cluster/cluster.zig` | High-level Raft cluster with state machine (*experimental*) |
 | **WriteAheadLog** | `src/cluster/wal.zig` | CRC32-validated WAL with crash recovery and truncation |
 | **SnapshotManager** | `src/cluster/snapshot.zig` | Raft snapshots with CRC validation and old snapshot cleanup |
 | **FFI** | `src/ffi/exports.zig` | C-ABI exports for cross-language integration |
@@ -248,6 +287,10 @@ const count = Codec.batchDecode(&large_buf, &orders);
 
 ## Performance
 
+The numbers below are **design targets, not measured results**. The benchmark
+suite is bundled (`zig build bench`) so you can measure on your own hardware;
+results vary with CPU, kernel configuration, and system load.
+
 ### Benchmark Targets
 
 | Benchmark | Metric | Target | Configuration |
@@ -277,7 +320,7 @@ Results are printed with HDR histogram percentiles (p50, p90, p99, p99.9, p99.99
 | Feature | ZigBolt | Aeron | Chronicle Queue | ZeroMQ | LMAX Disruptor |
 |---------|---------|-------|-----------------|--------|----------------|
 | Language | Zig | Java/C++ | Java | C | Java |
-| IPC Latency (p50) | < 200 ns | ~200 ns | ~1 us | ~10 us | ~100 ns |
+| IPC Latency (p50) | < 200 ns (target) | ~200 ns | ~1 us | ~10 us | ~100 ns |
 | SBE Codec | Yes (native) | SBE (XML codegen) | Chronicle Wire | No | N/A |
 | Zero-Copy Decode | Yes (comptime) | SBE codegen | Chronicle Wire | No | N/A |
 | GC Pauses | None | JVM GC | JVM GC | None | JVM GC |
@@ -288,12 +331,33 @@ Results are printed with HDR histogram percentiles (p50, p90, p99, p99.9, p99.99
 | Flow Control | Min/Max/Tagged | Min/Max/Tagged | N/A | HWM | N/A |
 | Broadcast Buffer | Yes (1-to-N) | Yes (1-to-N) | No | PUB/SUB | No |
 | Archive/Replay | Segment-based | Archive | Chronicle Queue | None | None |
-| Binary Size | ~100 KB | ~20 MB (JVM) | ~50 MB (JVM) | ~1 MB | ~10 MB (JVM) |
+| Binary Size | ~1 MB (no JVM/runtime) | ~20 MB (JVM) | ~50 MB (JVM) | ~1 MB | ~10 MB (JVM) |
 | Build Dependency | Zig compiler | JVM + Gradle | JVM + Maven | CMake | JVM + Gradle |
 
-## FFI (C / Rust / Python)
+ZigBolt's latency figure is a design target, not a measured result; figures
+for other systems are their publicly stated numbers. Run the bundled
+benchmarks (`zig build bench`) on your own hardware.
+
+## FFI & Language Bindings (C / Rust / Python / Go / TypeScript)
 
 ZigBolt exports a C-ABI shared library for cross-language integration.
+`zig build` produces `zig-out/lib/libzigbolt.dylib` (macOS) / `libzigbolt.so`
+(Linux) plus the static archive `libzigbolt.a`, with all 10 C-ABI exports.
+
+**All five bindings build and pass smoke tests against the real shared
+library** (each reports version 0.2.1). They live under [`bindings/`](bindings/):
+
+| Language | Directory | Mechanism | Setup |
+|----------|-----------|-----------|-------|
+| C | [`bindings/c`](bindings/c) | Header + link against `libzigbolt` | `make` (or CMake); pass `ZIGBOLT_LIB_PATH=/path/to/zig-out/lib` if not a sibling checkout |
+| Rust | [`bindings/rust`](bindings/rust) | Safe RAII wrappers, `build.rs` links + embeds rpath | `cargo build`; override location via `ZIGBOLT_LIB_PATH` |
+| Python | [`bindings/python`](bindings/python) | `ctypes`, no compilation | `pip install .`; finds the library via `ZIGBOLT_LIB_PATH` or a sibling `zig-out/lib` |
+| Go | [`bindings/go`](bindings/go) | cgo (bundled header) | `go build ./...`; defaults to the sibling `zig-out/lib`, override with `CGO_LDFLAGS` |
+| TypeScript / Node.js | [`bindings/ts`](bindings/ts) | [koffi](https://koffi.dev/) dynamic loading | `npm install`; set `ZIGBOLT_LIB_PATH` if the library is not in a standard location |
+
+The `ZIGBOLT_LIB_PATH` environment variable is shared by the bindings that
+load or locate the library at build/run time; it may point at the library
+file itself or the directory containing it.
 
 ### C Example
 
@@ -351,6 +415,40 @@ ch = lib.zigbolt_ipc_create(b"/my-channel", 1 << 20)
 data = (ctypes.c_uint8 * 3)(1, 2, 3)
 lib.zigbolt_publish(ch, data, 3, 42)
 lib.zigbolt_ipc_destroy(ch)
+```
+
+The packaged Python bindings (`bindings/python`, installable via `pip install .`)
+wrap this in a higher-level `IpcChannel` / `Transport` API.
+
+### Go Example (bindings/go, cgo)
+
+```go
+package main
+
+import (
+    "log"
+    zigbolt "github.com/suenot/zigbolt-go"
+)
+
+func main() {
+    ch, err := zigbolt.CreateChannel("/my-channel", 1<<20)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer ch.Close()
+
+    ch.Publish([]byte("hello"), 1)
+}
+```
+
+### TypeScript / Node.js Example (bindings/ts, koffi)
+
+```typescript
+import { IpcChannel } from "@zigbolt/node";
+
+const channel = IpcChannel.create({ name: "/my-channel", termLength: 1 << 20 });
+channel.publish(Buffer.from("hello"), /* msgTypeId */ 1);
+channel.destroy();
 ```
 
 ### FFI Functions Reference
@@ -430,6 +528,12 @@ zigbolt/
     logbuffer_throughput.zig  # LogBuffer claim/commit/read benchmark
     run_all.zig               # Full suite runner (writes bench/results.json)
     hdr_histogram.zig         # HDR histogram for latency measurement
+  bindings/              # Language bindings over the C-ABI shared library
+    c/                   # C header + Make/CMake examples
+    rust/                # Safe Rust wrappers (cargo)
+    python/              # ctypes-based package (pip)
+    go/                  # cgo bindings
+    ts/                  # TypeScript/Node.js bindings (koffi)
   frontend/              # Astro Starlight documentation site
     src/content/docs/    # Docs source (getting-started, architecture,
                          #   reference, examples, performance, changelog)

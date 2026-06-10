@@ -38,6 +38,18 @@ pub const NetworkConfig = struct {
     retransmit_interval_ns: u64 = 10_000_000, // 10ms
 };
 
+/// Wire convention for fragmented messages.
+///
+/// `NetworkHeader._reserved[0]` carries per-datagram flags; honest peers
+/// running the original protocol always sent these bytes as zero, so the
+/// unfragmented wire format is unchanged. When `FRAGMENT_FLAG` is set on a
+/// DATA datagram, its payload begins with a 16-byte `frag.FragmentHeader`
+/// (total_length / fragment_offset / message_id / fragment_length /
+/// begin+end flags) followed by the fragment bytes; the receiver routes it
+/// through the reassembler instead of delivering it directly. Small
+/// (<= MTU) messages keep the existing zero-overhead fast path.
+const FRAGMENT_FLAG: u8 = 0x01;
+
 /// A reliable, ordered network channel over UDP.
 ///
 /// Combines:
@@ -67,23 +79,43 @@ pub const NetworkChannel = struct {
     retransmit_tokens: u32,
     /// Start of the current retransmission rate-limit window.
     retransmit_window_start_ns: u64,
+    /// Message id assigned to the next fragmented publish (carried in
+    /// every FragmentHeader so the receiver can group fragments).
+    next_message_id: u32,
+    /// Ring paralleling the send buffer slots: true when the stored
+    /// payload at `seq % capacity` is a fragment datagram. NAK
+    /// retransmissions must restore the FRAGMENT_FLAG on the rebuilt
+    /// header — without it the receiver would deliver raw fragment bytes
+    /// (header included) as an application message.
+    frag_sent: []bool,
 
     /// Initialize a network channel.
     pub fn init(allocator: std.mem.Allocator, net_config: NetworkConfig) !NetworkChannel {
         const missing_buf = try allocator.alloc(u64, @intCast(net_config.recv_window_size));
         errdefer allocator.free(missing_buf);
+        const frag_sent = try allocator.alloc(bool, net_config.send_buffer_capacity);
+        errdefer allocator.free(frag_sent);
+        @memset(frag_sent, false);
+        // Clamp the MTU so NetworkHeader + FragmentHeader + payload always
+        // fits the 64 KB datagram buffer and the per-fragment payload
+        // budget stays positive.
+        const effective_mtu = std.math.clamp(net_config.mtu, 128, 65504);
         return .{
             .udp = try UdpChannel.init(net_config.udp),
             .send_buf = try reliability.SendBuffer.init(allocator, net_config.send_buffer_capacity),
             .recv_tracker = try reliability.RecvTracker.init(allocator, net_config.recv_window_size),
             .flow_control = reliability.FlowControl.init(net_config.flow_control_window),
             .fragmenter = frag.Fragmenter.init(.{
-                .mtu = net_config.mtu,
+                .mtu = effective_mtu,
                 .max_message_size = net_config.max_message_size,
             }),
             .reassembler = frag.Reassembler.init(allocator, .{
-                .mtu = net_config.mtu,
+                .mtu = effective_mtu,
                 .max_message_size = net_config.max_message_size,
+                // The pending-bytes budget must admit at least one
+                // maximum-size message or large messages could never
+                // complete reassembly.
+                .max_pending_bytes = @max(8 << 20, @as(usize, net_config.max_message_size) * 2),
             }),
             .config = net_config,
             .next_sequence = 0,
@@ -96,6 +128,8 @@ pub const NetworkChannel = struct {
             .current_gap_from = null,
             .retransmit_tokens = net_config.max_retransmits_per_interval,
             .retransmit_window_start_ns = 0,
+            .next_message_id = 0,
+            .frag_sent = frag_sent,
         };
     }
 
@@ -106,6 +140,7 @@ pub const NetworkChannel = struct {
         self.recv_tracker.deinit();
         self.reassembler.deinit();
         self.allocator.free(self.missing_buf);
+        self.allocator.free(self.frag_sent);
     }
 
     /// Publish a message over the network.
@@ -119,14 +154,41 @@ pub const NetworkChannel = struct {
     pub fn publish(self: *NetworkChannel, data: []const u8, msg_type_id: i32) !void {
         _ = msg_type_id;
 
-        if (self.fragmenter.needsFragmentation(data.len)) {
-            // Fragment and send each piece
-            var iter = self.fragmenter.fragmentIterator(data);
-            while (iter.next()) |fragment| {
-                try self.sendWithReliability(fragment.payload);
-            }
-        } else {
-            try self.sendWithReliability(data);
+        // Fail cleanly on anything the transport cannot carry end-to-end:
+        // the receiver's reassembler rejects messages above this limit, so
+        // sending them would only waste the wire.
+        if (data.len > self.config.max_message_size) return error.MessageTooLarge;
+
+        if (!self.fragmenter.needsFragmentation(data.len)) {
+            return self.sendWithReliability(data, false);
+        }
+
+        // Best-effort up-front credit check (message bytes + one
+        // FragmentHeader per fragment) so a back-pressured publish fails
+        // before any fragment hits the wire instead of leaving a partial
+        // message in flight. sendWithReliability still enforces the
+        // per-datagram budget authoritatively.
+        const max_payload: usize = self.fragmenter.maxPayloadPerFragment();
+        const fragment_count = (data.len + max_payload - 1) / max_payload;
+        const wire_bytes = data.len + fragment_count * frag.FragmentHeader.SIZE;
+        if (self.flow_control.available() < @as(i64, @intCast(wire_bytes))) {
+            return error.BackPressured;
+        }
+
+        const message_id = self.next_message_id;
+        self.next_message_id +%= 1;
+
+        // Each fragment datagram carries its FragmentHeader on the wire
+        // (previously the header was computed and then thrown away — the
+        // receiver got N anonymous slices instead of one message).
+        var datagram: [65536]u8 = undefined;
+        var iter = self.fragmenter.fragmentIterator(data, message_id);
+        while (iter.next()) |fragment| {
+            const hdr_bytes = std.mem.asBytes(&fragment.header);
+            const total = hdr_bytes.len + fragment.payload.len;
+            @memcpy(datagram[0..hdr_bytes.len], hdr_bytes);
+            @memcpy(datagram[hdr_bytes.len..][0..fragment.payload.len], fragment.payload);
+            try self.sendWithReliability(datagram[0..total], true);
         }
     }
 
@@ -191,8 +253,43 @@ pub const NetworkChannel = struct {
                         if (!rec.accepted) continue;
 
                         const msg_data = payload[reliability.NetworkHeader.SIZE..][0..hdr.payload_length];
-                        handler(msg_data);
-                        count += 1;
+
+                        if (hdr._reserved[0] & FRAGMENT_FLAG != 0) {
+                            // Fragment datagram: payload starts with a
+                            // FragmentHeader. Route it through the
+                            // reassembler; the complete message is
+                            // delivered exactly once, when the last
+                            // missing fragment arrives.
+                            if (msg_data.len < frag.FragmentHeader.SIZE) continue;
+                            var fh_buf: [frag.FragmentHeader.SIZE]u8 align(@alignOf(frag.FragmentHeader)) = undefined;
+                            @memcpy(&fh_buf, msg_data[0..frag.FragmentHeader.SIZE]);
+                            const fh: *const frag.FragmentHeader = @ptrCast(&fh_buf);
+
+                            // Reassembly key: session/stream are already
+                            // filtered to this channel's ids above, so the
+                            // sender's message_id (mixed with the stream id)
+                            // uniquely identifies the message.
+                            const key = (@as(u64, hdr.stream_id) << 32) | fh.message_id;
+                            const complete = self.reassembler.processFragment(
+                                key,
+                                fh.*,
+                                msg_data[frag.FragmentHeader.SIZE..],
+                            ) catch |err| switch (err) {
+                                // Allocation pressure is a local failure
+                                // and must surface; anything else is a
+                                // malformed/hostile fragment — drop it.
+                                error.OutOfMemory => return err,
+                                else => continue,
+                            };
+                            if (complete) |message| {
+                                defer self.allocator.free(message);
+                                handler(message);
+                                count += 1;
+                            }
+                        } else {
+                            handler(msg_data);
+                            count += 1;
+                        }
                     },
                     .nak => {
                         // Retransmit requested sequences
@@ -226,7 +323,7 @@ pub const NetworkChannel = struct {
 
     // ── Internal ─────────────────────────────────────────
 
-    fn sendWithReliability(self: *NetworkChannel, data: []const u8) !void {
+    fn sendWithReliability(self: *NetworkChannel, data: []const u8, is_fragment: bool) !void {
         // NET-4: Validate combined size fits in packet buffer.
         const hdr_size = @sizeOf(reliability.NetworkHeader);
         if (hdr_size + data.len > 65536) return error.MessageTooLarge;
@@ -241,13 +338,15 @@ pub const NetworkChannel = struct {
         const seq = self.next_sequence;
         self.next_sequence += 1;
 
-        // Build network header
+        // Build network header. Fragment datagrams are marked in the
+        // reserved flags byte (see FRAGMENT_FLAG).
         var hdr = reliability.NetworkHeader{
             .header_type = .data,
             .session_id = self.config.session_id,
             .stream_id = self.config.stream_id,
             .sequence = seq,
             .payload_length = @intCast(data.len),
+            ._reserved = .{ if (is_fragment) FRAGMENT_FLAG else 0, 0, 0 },
         };
 
         // Store for retransmission
@@ -256,6 +355,9 @@ pub const NetworkChannel = struct {
             self.flow_control.replenish(data.len);
             return err;
         };
+        // Remember whether this slot holds a fragment so a NAK
+        // retransmission rebuilds the header with the same marking.
+        self.frag_sent[@intCast(seq % self.send_buf.capacity)] = is_fragment;
         // Bytes evicted from an overwritten ring slot can never be
         // retransmitted — stop counting them as in flight.
         if (evicted > 0) self.flow_control.replenish(evicted);
@@ -307,12 +409,17 @@ pub const NetworkChannel = struct {
                 // Retransmit. NOTE: retransmits go to the configured remote
                 // (`send(.., null)`), never back to the datagram's source —
                 // this prevents NAK-reflection to spoofed victims.
+                // The rebuilt header must carry the original fragment
+                // marking, or the receiver would deliver the stored
+                // FragmentHeader + fragment bytes as a raw message.
+                const was_fragment = self.frag_sent[@intCast(seq % self.send_buf.capacity)];
                 var hdr = reliability.NetworkHeader{
                     .header_type = .data,
                     .session_id = self.config.session_id,
                     .stream_id = self.config.stream_id,
                     .sequence = seq,
                     .payload_length = @intCast(entry.data.len),
+                    ._reserved = .{ if (was_fragment) FRAGMENT_FLAG else 0, 0, 0 },
                 };
                 var packet: [65536]u8 = undefined;
                 const hdr_bytes = std.mem.asBytes(&hdr);
@@ -421,6 +528,19 @@ fn testCountingHandler(data: []const u8) void {
 
 fn testNoopHandler(data: []const u8) void {
     _ = data;
+}
+
+// Capture state for fragmentation round-trip tests: stores the most
+// recently delivered message verbatim.
+var g_capture_buf: [16384]u8 = undefined;
+var g_capture_len: usize = 0;
+var g_capture_calls: u32 = 0;
+
+fn testCaptureHandler(data: []const u8) void {
+    g_capture_calls += 1;
+    const n = @min(data.len, g_capture_buf.len);
+    @memcpy(g_capture_buf[0..n], data[0..n]);
+    g_capture_len = data.len;
 }
 
 fn boundAddress(fd: posix.socket_t) !net.Address {
@@ -824,4 +944,206 @@ test "NetworkChannel expected_peer pins the source address" {
     try pollUntilDelivered(&ch, 1);
     try std.testing.expectEqual(@as(u32, 1), g_delivered_count);
     try std.testing.expectEqual(@as(usize, 1), g_delivered_bytes); // "y" only
+}
+
+test "NetworkChannel round-trips a fragmented message exactly once" {
+    const allocator = std.testing.allocator;
+    g_capture_calls = 0;
+    g_capture_len = 0;
+
+    // Receiver channel: bound to an ephemeral loopback port.
+    var rx = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+            .non_blocking = true,
+        },
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+    });
+    defer rx.deinit();
+    const rx_addr = try boundAddress(rx.udp.socket_fd);
+
+    // Sender channel pointed at the receiver.
+    var tx = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+            .non_blocking = true,
+            .remote_address = rx_addr,
+        },
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+    });
+    defer tx.deinit();
+
+    // ~7x the per-fragment payload (default MTU 1472 -> 1456 bytes per
+    // fragment): 10_000 bytes => 7 fragments. Before the fix, publish()
+    // silently split this into 7 anonymous slices and the handler saw 7
+    // bogus "messages" instead of one.
+    var msg: [10_000]u8 = undefined;
+    for (&msg, 0..) |*b, i| {
+        b.* = @intCast((i * 31 + 7) % 256);
+    }
+
+    try tx.publish(&msg, 1);
+    try std.testing.expectEqual(@as(u64, 7), tx.next_sequence);
+
+    for (0..200) |_| {
+        _ = try rx.poll(testCaptureHandler, 16);
+        if (g_capture_calls >= 1) break;
+        std.Thread.sleep(100_000); // 100 μs
+    }
+
+    // Delivered exactly once, complete and byte-exact.
+    try std.testing.expectEqual(@as(u32, 1), g_capture_calls);
+    try std.testing.expectEqual(msg.len, g_capture_len);
+    try std.testing.expectEqualSlices(u8, &msg, g_capture_buf[0..g_capture_len]);
+
+    // Further polls must not re-deliver it.
+    for (0..10) |_| {
+        _ = try rx.poll(testCaptureHandler, 16);
+    }
+    try std.testing.expectEqual(@as(u32, 1), g_capture_calls);
+
+    // Small messages still ride the unfragmented fast path on the same
+    // stream, after the fragmented one.
+    try tx.publish("tiny", 1);
+    for (0..200) |_| {
+        _ = try rx.poll(testCaptureHandler, 16);
+        if (g_capture_calls >= 2) break;
+        std.Thread.sleep(100_000);
+    }
+    try std.testing.expectEqual(@as(u32, 2), g_capture_calls);
+    try std.testing.expectEqual(@as(usize, 4), g_capture_len);
+    try std.testing.expectEqualSlices(u8, "tiny", g_capture_buf[0..4]);
+}
+
+test "NetworkChannel publish fails cleanly above max_message_size" {
+    const allocator = std.testing.allocator;
+
+    var ch = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+            .non_blocking = true,
+            .remote_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 9999),
+        },
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+        .max_message_size = 4096,
+    });
+    defer ch.deinit();
+
+    const big = try allocator.alloc(u8, 8192);
+    defer allocator.free(big);
+    @memset(big, 0xCD);
+
+    // Larger than the transport can deliver end-to-end: a clean error,
+    // never a silent split.
+    try std.testing.expectError(error.MessageTooLarge, ch.publish(big, 1));
+    // Nothing hit the wire.
+    try std.testing.expectEqual(@as(u64, 0), ch.next_sequence);
+
+    // A message within the limit (fragmented) still goes out.
+    const ok = try allocator.alloc(u8, 4000);
+    defer allocator.free(ok);
+    @memset(ok, 0xAB);
+    try ch.publish(ok, 1);
+    try std.testing.expectEqual(@as(u64, 3), ch.next_sequence); // 1456+1456+1088
+}
+
+test "NetworkChannel retransmits fragments with the fragment marking intact" {
+    const allocator = std.testing.allocator;
+
+    // Raw UDP receiver standing in for the remote peer.
+    var receiver = try UdpChannel.init(.{
+        .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+        .non_blocking = true,
+    });
+    defer receiver.deinit();
+    const receiver_addr = try boundAddress(receiver.socket_fd);
+
+    var ch = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+            .non_blocking = true,
+            .remote_address = receiver_addr,
+        },
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+    });
+    defer ch.deinit();
+    const ch_addr = try boundAddress(ch.udp.socket_fd);
+
+    // 3000 bytes => 3 fragments (1456 + 1456 + 88), sequences 0..2.
+    var msg: [3000]u8 = undefined;
+    for (&msg, 0..) |*b, i| {
+        b.* = @intCast((i * 13 + 5) % 256);
+    }
+    try ch.publish(&msg, 1);
+    try std.testing.expectEqual(@as(u64, 3), ch.next_sequence);
+
+    // Drain the three original fragment datagrams; keep the first (seq 0).
+    var first_dg: [4096]u8 = undefined;
+    var first_len: usize = 0;
+    var buf: [4096]u8 = undefined;
+    var got: u32 = 0;
+    for (0..400) |_| {
+        if (try receiver.recv(&buf)) |r| {
+            if (got == 0) {
+                @memcpy(first_dg[0..r.data.len], r.data);
+                first_len = r.data.len;
+            }
+            got += 1;
+            if (got == 3) break;
+        } else {
+            std.Thread.sleep(100_000);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 3), got);
+    // Original datagram is marked as a fragment.
+    try std.testing.expect(first_dg[@offsetOf(reliability.NetworkHeader, "_reserved")] & FRAGMENT_FLAG != 0);
+
+    // NAK sequence 0: the channel must retransmit it byte-identically —
+    // including the fragment marking. Without it, the receiver would
+    // deliver the raw FragmentHeader + fragment bytes as a message.
+    var nak_buf: [128]u8 = undefined;
+    _ = try receiver.send(buildNakPacket(&nak_buf, 1, 1, 0, 1), ch_addr);
+
+    for (0..200) |_| {
+        _ = try ch.poll(testNoopHandler, 16);
+        if (ch.send_buf.get(0)) |e| {
+            if (e.retransmit_count > 0) break;
+        }
+        std.Thread.sleep(100_000);
+    }
+    try std.testing.expectEqual(@as(u8, 1), ch.send_buf.get(0).?.retransmit_count);
+
+    // ch.poll() also emits heartbeats to the receiver — skip any non-data
+    // datagram while waiting for the retransmission.
+    var retransmitted: ?UdpChannel.RecvResult = null;
+    for (0..200) |_| {
+        if (try receiver.recv(&buf)) |r| {
+            const type_byte = r.data[@offsetOf(reliability.NetworkHeader, "header_type")];
+            if (type_byte == @intFromEnum(reliability.NetworkHeader.HeaderType.data)) {
+                retransmitted = r;
+                break;
+            }
+            continue;
+        }
+        std.Thread.sleep(100_000);
+    }
+    try std.testing.expect(retransmitted != null);
+    const rt = retransmitted.?.data;
+    try std.testing.expectEqual(first_len, rt.len);
+    // Compare the defined header fields and the payload; the extern
+    // struct's padding bytes (offsets 2..4, 12..16, 31) are undefined and
+    // legitimately differ between the two header builds.
+    try std.testing.expectEqualSlices(u8, first_dg[0..2], rt[0..2]); // version + type
+    try std.testing.expectEqualSlices(u8, first_dg[4..12], rt[4..12]); // session + stream
+    try std.testing.expectEqualSlices(u8, first_dg[16..31], rt[16..31]); // sequence + length + flags
+    // Payload: FragmentHeader + fragment bytes, byte-identical.
+    try std.testing.expectEqualSlices(
+        u8,
+        first_dg[reliability.NetworkHeader.SIZE..first_len],
+        rt[reliability.NetworkHeader.SIZE..],
+    );
 }

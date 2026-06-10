@@ -53,6 +53,9 @@ pub const Cluster = struct {
     }
 
     /// Tick: called periodically. Applies committed entries to the state machine.
+    /// getApplicableEntries returns exactly (last_applied, commit_index], so
+    /// each committed entry is applied exactly once, in log order, and an
+    /// uncommitted entry is never applied.
     pub fn tick(self: *Cluster) void {
         const entries = self.node.getApplicableEntries();
         if (entries.len == 0) return;
@@ -63,8 +66,8 @@ pub const Cluster = struct {
             }
         }
 
-        // Mark all as applied up to commit_index
-        self.node.markApplied(self.node.commit_index);
+        // Mark applied up to the last entry actually applied above.
+        self.node.markApplied(entries[entries.len - 1].index);
     }
 
     /// Check if this node is the leader.
@@ -180,6 +183,96 @@ test "Cluster: tick applies committed entries to state machine" {
     // Another tick — nothing new to apply
     cluster.tick();
     try std.testing.expectEqual(@as(u32, 2), test_applied_count);
+}
+
+var test_exact_buf: [16]u8 = undefined;
+var test_exact_len: usize = 0;
+
+fn testApplyRecord(entry: []const u8) void {
+    if (test_exact_len < test_exact_buf.len and entry.len > 0) {
+        test_exact_buf[test_exact_len] = entry[0];
+    }
+    test_exact_len += 1;
+}
+
+test "Cluster: applies each committed entry exactly once and never an uncommitted one" {
+    test_exact_len = 0;
+
+    const sm = StateMachine{
+        .apply_fn = &testApplyRecord,
+    };
+    var cluster = try Cluster.init(std.testing.allocator, .{
+        .node_id = 0,
+        .peer_count = 2,
+    }, sm);
+    defer cluster.deinit();
+
+    // Become leader (term 1)
+    _ = cluster.node.startElection();
+    _ = cluster.node.handleMessage(1, .{ .request_vote_response = .{
+        .term = 1,
+        .vote_granted = true,
+    } });
+    try std.testing.expect(cluster.isLeader());
+
+    _ = try cluster.propose("1");
+    _ = try cluster.propose("2");
+    _ = try cluster.propose("3");
+    _ = try cluster.propose("4");
+    _ = try cluster.propose("5");
+
+    // Nothing committed yet: nothing may be applied.
+    cluster.tick();
+    try std.testing.expectEqual(@as(usize, 0), test_exact_len);
+
+    // commit_index = 2 while log = [1..5]: ONLY entries 1 and 2 are applied.
+    cluster.node.match_index[0] = 2;
+    cluster.node.match_index[1] = 2;
+    cluster.node.updateCommitIndex();
+    cluster.tick();
+    try std.testing.expectEqual(@as(usize, 2), test_exact_len);
+    try std.testing.expectEqualStrings("12", test_exact_buf[0..test_exact_len]);
+
+    // Re-ticking applies nothing again (no double execution).
+    cluster.tick();
+    cluster.tick();
+    try std.testing.expectEqual(@as(usize, 2), test_exact_len);
+
+    // Commit advances to 5: entries 3..5 are applied exactly once, in order.
+    cluster.node.match_index[0] = 5;
+    cluster.node.match_index[1] = 5;
+    cluster.node.updateCommitIndex();
+    cluster.tick();
+    try std.testing.expectEqual(@as(usize, 5), test_exact_len);
+    try std.testing.expectEqualStrings("12345", test_exact_buf[0..test_exact_len]);
+
+    cluster.tick();
+    try std.testing.expectEqual(@as(usize, 5), test_exact_len);
+}
+
+test "Cluster: single-node cluster elects itself and applies proposals" {
+    test_applied_count = 0;
+
+    const sm = StateMachine{
+        .apply_fn = &testApply,
+    };
+    var cluster = try Cluster.init(std.testing.allocator, .{
+        .node_id = 0,
+        .peer_count = 0,
+    }, sm);
+    defer cluster.deinit();
+
+    // One election timeout is enough: quorum of 1.
+    _ = cluster.node.startElection();
+    try std.testing.expect(cluster.isLeader());
+
+    _ = try cluster.propose("only");
+    try std.testing.expectEqual(@as(u64, 1), cluster.node.commit_index);
+
+    cluster.tick();
+    try std.testing.expectEqual(@as(u32, 1), test_applied_count);
+    cluster.tick();
+    try std.testing.expectEqual(@as(u32, 1), test_applied_count);
 }
 
 test "Cluster: handleMessage delegates to raft node" {

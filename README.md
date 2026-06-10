@@ -38,7 +38,11 @@ runtime overhead.
 
 ZigBolt is a young project. What is verified today:
 
-- **423 tests pass** via `zig build test`, in both Debug and ReleaseFast builds.
+- **494 tests pass** via `zig build test`, in both Debug and ReleaseFast builds,
+  on macOS and Linux.
+- **Line coverage is measured, not guessed**: 98.3% raw / 100% of measurable
+  lines (kcov on Linux; 204 audited exclusions for kcov attribution gaps and
+  non-injectable OS-failure branches, each with an inline justification).
 - **The C-ABI shared library builds by default**: `zig build` produces
   `zig-out/lib/libzigbolt.{dylib,so}` and `libzigbolt.a` with all 10 exports.
 - **All five language bindings** (C, Rust, Python, Go, TypeScript) build and
@@ -131,12 +135,26 @@ zig build
 zig build test
 ```
 
-Runs the full unit test suite (423 tests, including the FFI surface). The
+Runs the full unit test suite (494 tests, including the FFI surface). The
 suite passes in both Debug and ReleaseFast builds:
 
 ```bash
 zig build test -Doptimize=ReleaseFast
 ```
+
+### Measure Coverage
+
+```bash
+./scripts/coverage.sh        # total + per-file percentages
+python3 scripts/uncovered.py # uncovered lines, with source text per file
+```
+
+kcov has no macOS support, so the script cross-compiles the test binaries for
+Linux (`zig build install-tests -Dtarget=aarch64-linux-gnu`) and runs them
+under kcov inside a Debian container — Docker must be running. Current state:
+98.3% raw, 100% of measurable lines. Lines excluded from measurement carry an
+inline `kcov-skip: <reason>` marker (kcov attribution gaps on aarch64 Debug
+builds, OS-failure branches that cannot be injected in-process).
 
 ### Run Benchmarks
 

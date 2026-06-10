@@ -235,18 +235,9 @@ pub const CongestionControl = struct {
         return self.cwnd - self.bytes_in_flight;
     }
 
-    /// Reset to initial state.
+    /// Reset to initial state: window/ssthresh back to defaults,
+    /// max/min/mss limits preserved.
     pub fn reset(self: *CongestionControl) void {
-        const cfg = CongestionConfig{
-            .initial_window = self.cwnd,
-            .max_window = self.max_window, // kcov-skip: runs in reset() (covered test); literal field stores folded, no own line record
-            .min_window = self.min_window,
-            .mss = self.mss, // kcov-skip: runs in reset() (covered test); literal field stores folded, no own line record
-            .initial_ssthresh = self.ssthresh,
-        };
-        _ = cfg;
-        // Preserve config but reset dynamic state.
-        self.cwnd = self.max_window; // Will be overridden below.
         self.* = init(.{
             .initial_window = 64 * 1024,
             .max_window = self.max_window,

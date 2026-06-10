@@ -2,7 +2,9 @@
 
 ## Build & Test
 - `zig build` — build all targets
-- `zig build test` — run all unit tests
+- `zig build test` — run all unit tests (494; pass on macOS and Linux, Debug and ReleaseFast)
+- `./scripts/coverage.sh` — line coverage via kcov in a Linux Docker container (no kcov on macOS); `python3 scripts/uncovered.py` lists uncovered lines. Lines with a `kcov-skip: <reason>` marker are excluded from measurement — use only for kcov attribution gaps or non-injectable OS-failure branches, always with the justification inline
+- `zig build install-tests -Dtarget=aarch64-linux-gnu` — cross-compile test binaries without running (used by coverage.sh)
 - `zig build bench` — run the FULL benchmark suite (bench/run_all.zig; writes bench/results.json)
 - `./zig-out/bin/bench_ping_pong` — IPC ping-pong (RTT) benchmark
 - `./zig-out/bin/bench_throughput` — throughput benchmark

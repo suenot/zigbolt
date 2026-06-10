@@ -458,11 +458,16 @@ test "IpcChannel empty poll returns zero" {
     var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
     defer ch.deinit();
 
-    const count = ch.poll(&struct {
+    const H = struct {
         fn handler(_: IpcChannel.ReadResult) void {}
-    }.handler, 10);
+    };
 
+    const count = ch.poll(&H.handler, 10);
     try std.testing.expectEqual(@as(u32, 0), count);
+
+    // The same no-op handler does run once a message exists.
+    try ch.publish("now nonempty", 1);
+    try std.testing.expectEqual(@as(u32, 1), ch.poll(&H.handler, 10));
 }
 
 test "create rejects invalid term_length" {
@@ -571,6 +576,111 @@ test "poll does not read out of bounds for attacker-set head near term end" {
     ch.meta.tail_position.store(8192, .monotonic);
     try std.testing.expectEqual(@as(u32, 0), ch.poll(&S.handler, 10));
     try std.testing.expectEqual(@as(u32, 0), S.calls);
+
+    // With the forged positions cleared, normal delivery resumes and the
+    // (previously never-invoked) handler runs exactly once.
+    ch.meta.head_position.store(0, .monotonic);
+    ch.meta.tail_position.store(0, .monotonic);
+    try ch.publish("clean again", 2);
+    try std.testing.expectEqual(@as(u32, 1), ch.poll(&S.handler, 10));
+    try std.testing.expectEqual(@as(u32, 1), S.calls);
+}
+
+test "IpcChannel poll skips rotation padding frames" {
+    const name = "/zigbolt_test_ipc_pad";
+
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096 });
+    defer ch.deinit();
+
+    // 3000-byte payload -> 3008-byte aligned frame. The second frame does
+    // not fit in the remaining 1088 bytes of term 0, so publish writes a
+    // padding frame and rotates; poll must skip the padding.
+    var payload: [3000]u8 = undefined;
+    @memset(&payload, 0x5A);
+    try ch.publish(&payload, 1);
+    try ch.publish(&payload, 2);
+
+    const S = struct {
+        var n: u32 = 0;
+        var intact = true;
+        fn handler(result: IpcChannel.ReadResult) void {
+            n += 1;
+            if (result.data.len != 3000) intact = false;
+            for (result.data) |b| {
+                if (b != 0x5A) intact = false;
+            }
+        }
+    };
+    S.n = 0;
+    S.intact = true;
+
+    try std.testing.expectEqual(@as(u32, 2), ch.poll(&S.handler, 10));
+    try std.testing.expectEqual(@as(u32, 2), S.n);
+    try std.testing.expect(S.intact);
+    // The reader crossed the padding into term 1.
+    try std.testing.expect(ch.meta.head_position.load(.monotonic) > 4096);
+}
+
+test "IpcChannel create without pre-fault works" {
+    const name = "/zigbolt_test_ipc_nofault";
+
+    var ch = try IpcChannel.create(name, .{ .term_length = 4096, .pre_fault = false });
+    defer ch.deinit();
+
+    try ch.publish("no prefault", 3);
+
+    const S = struct {
+        var got: u32 = 0;
+        fn handler(_: IpcChannel.ReadResult) void {
+            got += 1;
+        }
+    };
+    S.got = 0;
+    try std.testing.expectEqual(@as(u32, 1), ch.poll(&S.handler, 10));
+    try std.testing.expectEqual(@as(u32, 1), S.got);
+}
+
+test "open detects a term_length flip between probe and final mapping" {
+    const name = "/zigbolt_test_ipc_flip";
+
+    // Created with the LARGER length, so both flip values fit the backing
+    // object and a failed open can only be the probe/recheck mismatch —
+    // the TOCTOU defence under test.
+    var pub_ch = try IpcChannel.create(name, .{ .term_length = 8192 });
+    defer pub_ch.deinit();
+
+    const Flipper = struct {
+        fn run(tl: *u32, stop: *std.atomic.Value(bool)) void {
+            var v: u32 = 4096;
+            while (!stop.load(.acquire)) {
+                @atomicStore(u32, tl, v, .monotonic);
+                v = if (v == 4096) 8192 else 4096;
+            }
+            @atomicStore(u32, tl, 8192, .monotonic);
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const flipper = try std.Thread.spawn(.{}, Flipper.run, .{ &pub_ch.meta.term_length, &stop });
+
+    var saw_mismatch = false;
+    var attempts: usize = 0;
+    while (attempts < 100_000 and !saw_mismatch) : (attempts += 1) {
+        if (IpcChannel.open(name, .{})) |opened| {
+            var ch = opened;
+            ch.deinit();
+        } else |err| {
+            try std.testing.expectEqual(error.TermLengthMismatch, err);
+            saw_mismatch = true;
+        }
+    }
+
+    stop.store(true, .release);
+    flipper.join();
+    try std.testing.expect(saw_mismatch);
+
+    // With the header stable again, open succeeds.
+    var ch = try IpcChannel.open(name, .{});
+    ch.deinit();
 }
 
 test "poll and publish reject corrupt head/tail positions" {

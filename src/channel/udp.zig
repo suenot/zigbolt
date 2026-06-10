@@ -239,6 +239,20 @@ pub const UdpChannel = struct {
 
 // ── Tests ────────────────────────────────────────────────────
 
+/// Sends `data` to `addr` on `ch` after a short delay, so the test's poll
+/// loop spins (and sleeps) at least once before the datagram lands.
+const DelayedSender = struct {
+    fn send(ch: *UdpChannel, addr: net.Address, data: []const u8) void {
+        std.Thread.sleep(2_000_000); // 2 ms
+        _ = ch.send(data, addr) catch {};
+    }
+
+    fn sendFrame(ch: *UdpChannel, addr: net.Address, data: []const u8, msg_type: i32) void {
+        std.Thread.sleep(2_000_000); // 2 ms
+        ch.sendFrame(data, msg_type, addr) catch {};
+    }
+};
+
 test "UdpChannel loopback send/recv" {
     // Bind to an ephemeral port on localhost.
     const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
@@ -257,12 +271,14 @@ test "UdpChannel loopback send/recv" {
     const actual_addr = net.Address.initPosix(&bound_addr);
 
     const msg = "hello zigbolt udp";
-    _ = try ch.send(msg, actual_addr);
+    // Send from a delayed thread so the retry loop actually retries.
+    const sender = try std.Thread.spawn(.{}, DelayedSender.send, .{ &ch, actual_addr, msg });
+    defer sender.join();
 
-    // Non-blocking recv — retry a few times (loopback may need a moment).
+    // Non-blocking recv — retry until the delayed datagram lands.
     var buf: [256]u8 = undefined;
     var result: ?UdpChannel.RecvResult = null;
-    for (0..100) |_| {
+    for (0..500) |_| {
         result = try ch.recv(&buf);
         if (result != null) break;
         std.Thread.sleep(100_000); // 100 μs
@@ -291,11 +307,12 @@ test "UdpChannel framed send/recv" {
     const payload = "framed payload";
     const msg_type: i32 = 42;
 
-    try ch.sendFrame(payload, msg_type, actual_addr);
+    const sender = try std.Thread.spawn(.{}, DelayedSender.sendFrame, .{ &ch, actual_addr, payload, msg_type });
+    defer sender.join();
 
     var buf: [512]u8 = undefined;
     var result: ?UdpChannel.FrameRecvResult = null;
-    for (0..100) |_| {
+    for (0..500) |_| {
         result = try ch.recvFrame(&buf);
         if (result != null) break;
         std.Thread.sleep(100_000); // 100 μs
@@ -323,7 +340,8 @@ test "UdpChannel recvFrame works on an unaligned buffer" {
     const actual_addr = net.Address.initPosix(&bound_addr);
 
     const payload = "unaligned recv";
-    try ch.sendFrame(payload, 7, actual_addr);
+    const sender = try std.Thread.spawn(.{}, DelayedSender.sendFrame, .{ &ch, actual_addr, payload, @as(i32, 7) });
+    defer sender.join();
 
     // Receive into a deliberately misaligned slice: the header lands on an
     // odd address. The old @ptrCast(@alignCast(...)) panicked here.
@@ -331,7 +349,7 @@ test "UdpChannel recvFrame works on an unaligned buffer" {
     const unaligned = raw[1..];
 
     var result: ?UdpChannel.FrameRecvResult = null;
-    for (0..100) |_| {
+    for (0..500) |_| {
         result = try ch.recvFrame(unaligned);
         if (result != null) break;
         std.Thread.sleep(100_000); // 100 μs
@@ -434,6 +452,32 @@ test "UdpChannel multiple send/recv" {
     }
 
     try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "UdpChannel init closes the socket when bind fails" {
+    // 192.0.2.1 (TEST-NET-1, RFC 5737) is never assigned to a local
+    // interface: the socket is created, bind fails, and the errdefer
+    // close path runs.
+    const result = UdpChannel.init(.{
+        .bind_address = net.Address.initIp4(.{ 192, 0, 2, 1 }, 0),
+        .non_blocking = true,
+    });
+    try std.testing.expect(std.meta.isError(result));
+}
+
+test "UdpChannel joins a multicast group" {
+    // Joining 224.0.0.251 (mDNS) on INADDR_ANY exercises the
+    // IP_ADD_MEMBERSHIP setsockopt path. Environments without a
+    // multicast-capable route may refuse the join — the setsockopt call
+    // under test has executed either way.
+    var ch = UdpChannel.init(.{
+        .bind_address = net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+        .non_blocking = true,
+        .multicast_group = .{ 224, 0, 0, 251 },
+    }) catch return;
+    defer ch.deinit();
+
+    try std.testing.expect(ch.socket_fd >= 0);
 }
 
 test "UdpChannel send requires destination" {

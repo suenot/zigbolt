@@ -698,3 +698,65 @@ test "FlowControl zero window" {
 test "NakMessage layout" {
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(NakMessage));
 }
+
+test "RecvTracker advanceContiguous walks past already-set bits" {
+    const allocator = std.testing.allocator;
+    var tracker = try RecvTracker.init(allocator, 64);
+    defer tracker.deinit();
+
+    // Drive the helper's documented contract directly: with a contiguous
+    // run of received bits at next_expected, it must advance past all of
+    // them (the public path can only ever find an unset bit there, so the
+    // walk is otherwise pure defence).
+    tracker.received_bitmap.set(0);
+    tracker.received_bitmap.set(1);
+    tracker.received_bitmap.set(2);
+    tracker.advanceContiguous();
+    try std.testing.expectEqual(@as(u64, 3), tracker.next_expected);
+
+    // Stops at the first gap.
+    tracker.received_bitmap.set(4);
+    tracker.advanceContiguous();
+    try std.testing.expectEqual(@as(u64, 3), tracker.next_expected);
+}
+
+test "RecvTracker getMissing surfaces allocation failure without leaking" {
+    const allocator = std.testing.allocator;
+    var tracker = try RecvTracker.init(allocator, 64);
+    defer tracker.deinit();
+
+    _ = tracker.recordReceived(0);
+    _ = tracker.recordReceived(5); // gap: 1..4 missing
+
+    // The first append allocation fails: the errdefer must clean up the
+    // partial list (the testing allocator's leak check verifies it).
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, tracker.getMissing(failing.allocator()));
+
+    // The tracker itself is unharmed and reports the gap normally.
+    const missing = try tracker.getMissing(allocator);
+    defer allocator.free(missing);
+    try std.testing.expectEqual(@as(usize, 4), missing.len);
+}
+
+test "FlowControl concurrent consume stays exact under contention" {
+    var fc = FlowControl.init(1_000_000_000);
+
+    // Two threads hammering tryConsume on the same cache line force the
+    // weak CAS to fail and retry; the final balance must still be exact.
+    const per_thread = 50_000;
+    const Worker = struct {
+        fn consume(f: *FlowControl, n: usize) void {
+            var done: usize = 0;
+            while (done < n) {
+                if (f.tryConsume(1)) done += 1;
+            }
+        }
+    };
+    var t1 = try std.Thread.spawn(.{}, Worker.consume, .{ &fc, per_thread });
+    var t2 = try std.Thread.spawn(.{}, Worker.consume, .{ &fc, per_thread });
+    t1.join();
+    t2.join();
+
+    try std.testing.expectEqual(@as(i64, 1_000_000_000 - 2 * per_thread), fc.available());
+}

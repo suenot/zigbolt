@@ -736,7 +736,7 @@ test "publish returns BackPressure instead of lapping a stalled reader" {
     var payload: [1016]u8 = undefined;
     @memset(&payload, 0xAB);
 
-    var i: usize = 0;
+    var i: usize = 0; // kcov-skip: test loop var; loop publishes 8 frames (asserted); hit record oscillates between builds
     while (i < 8) : (i += 1) {
         try ch.publish(&payload, 1);
     }

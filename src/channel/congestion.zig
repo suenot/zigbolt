@@ -660,7 +660,7 @@ test "NakController backoff shift is clamped at 63" {
     });
 
     for (0..100) |i| {
-        nak.onNakSent(@intCast(i + 1));
+        nak.onNakSent(@intCast(i + 1)); // kcov-skip: test loop body, runs 100x (backoff_multiplier==100 asserted); hit record oscillates between builds
     }
     try std.testing.expectEqual(@as(u32, 100), nak.backoff_multiplier);
 

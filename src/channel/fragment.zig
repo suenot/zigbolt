@@ -454,7 +454,7 @@ test "fragment and reassemble large message" {
     // Fragment and reassemble
     var iter = fragmenter.fragmentIterator(&msg, 42);
     var fragment_count: usize = 0;
-    var result: ?[]const u8 = null;
+    var result: ?[]const u8 = null; // kcov-skip: test local init; the passing test asserts on result; hit record oscillates between builds
 
     while (iter.next()) |frag| {
         fragment_count += 1;
@@ -687,7 +687,7 @@ test "reassembler bounds pending messages under a flood of incomplete messages" 
 
     // 100 distinct message keys, none of which ever completes. Before the
     // cap, every key pinned a buffer forever (unbounded memory growth).
-    var key: u64 = 0;
+    var key: u64 = 0; // kcov-skip: test loop var; loop effects asserted (pending count); hit record oscillates between builds
     while (key < 100) : (key += 1) {
         try std.testing.expect((try reassembler.processFragment(key, header, &payload)) == null);
     }
@@ -718,7 +718,7 @@ test "reassembler bounds pending bytes and rejects messages over the byte cap" {
         .flags = .{ .begin = true },
     };
 
-    var key: u64 = 0;
+    var key: u64 = 0; // kcov-skip: test loop var; loop effects asserted (pending count); hit record oscillates between builds
     while (key < 10) : (key += 1) {
         try std.testing.expect((try reassembler.processFragment(key, header, &payload)) == null);
         try std.testing.expect(reassembler.pending_bytes <= 1000);

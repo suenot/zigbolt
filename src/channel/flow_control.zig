@@ -629,7 +629,7 @@ test "TaggedFlowControl — only tagged receivers limit" {
         .timestamp_ns = 1000,
     };
 
-    const limit = fc.onStatusMessageTagged(tagged_status, 42, 0, 0, 16, 1000);
+    const limit = fc.onStatusMessageTagged(tagged_status, 42, 0, 0, 16, 1000); // kcov-skip: test line; result asserted next line; hit record oscillates between builds
 
     // position = 500, limit = 500 + 1000 = 1500
     try std.testing.expectEqual(@as(i64, 1500), limit);
@@ -784,7 +784,7 @@ test "TaggedFlowControl — mixed tagged and untagged receivers" {
         .receiver_id = 1,
         .timestamp_ns = 1000,
     };
-    _ = fc.onStatusMessageTagged(tagged, 10, 0, 0, 16, 1000);
+    _ = fc.onStatusMessageTagged(tagged, 10, 0, 0, 16, 1000); // kcov-skip: test line; effects asserted below; hit record oscillates between builds
 
     // Add an untagged receiver at position 100+500 = 600 (lower, but should not limit)
     const untagged = ReceiverStatus{
@@ -886,7 +886,7 @@ test "flow control position arithmetic saturates instead of overflowing" {
     // Tagged path saturates too.
     var fc_tagged = TaggedFlowControl{};
     fc_tagged.required_group_tag = 1;
-    const limit_tagged = fc_tagged.onStatusMessageTagged(hostile, 1, 0, 0, 63, 1000);
+    const limit_tagged = fc_tagged.onStatusMessageTagged(hostile, 1, 0, 0, 63, 1000); // kcov-skip: test line; result asserted next line; hit record oscillates between builds
     try std.testing.expectEqual(std.math.maxInt(i64), limit_tagged);
 }
 

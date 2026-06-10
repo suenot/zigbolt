@@ -482,7 +482,10 @@ pub const SbeDecoder = struct {
         return slice;
     }
 
-    /// Read an enum value by reading its underlying integer and casting.
+    /// Read an enum value by reading its underlying integer and validating
+    /// it against the enum's named tags. The wire byte is untrusted: an
+    /// out-of-range value on an exhaustive enum returns
+    /// error.InvalidEnumValue instead of invoking illegal behavior.
     pub fn getEnum(self: *SbeDecoder, comptime E: type) !E {
         const Tag = @typeInfo(E).@"enum".tag_type;
         const size = @sizeOf(Tag);
@@ -505,7 +508,7 @@ pub const SbeDecoder = struct {
             },
             else => @compileError("unsupported enum tag size"),
         };
-        return @enumFromInt(int_val);
+        return std.meta.intToEnum(E, int_val) catch error.InvalidEnumValue;
     }
 
     /// Read variable-length data: [u32 length][data bytes].
@@ -660,6 +663,24 @@ test "SBE — enum encode/decode" {
 
     try testing.expectEqual(TestSide.sell, try dec.getEnum(TestSide));
     try testing.expectEqual(TestOrdType.limit, try dec.getEnum(TestOrdType));
+}
+
+test "SBE — getEnum rejects out-of-range wire bytes" {
+    // u8-tagged enum: 7 is not a TestSide tag (buy=0, sell=1).
+    var buf1 = [_]u8{7};
+    var dec1 = SbeDecoder.init(&buf1);
+    try testing.expectError(error.InvalidEnumValue, dec1.getEnum(TestSide));
+
+    // u16-tagged enum: 999 is not a TestOrdType tag.
+    var buf2: [2]u8 = undefined;
+    std.mem.writeInt(u16, &buf2, 999, .little);
+    var dec2 = SbeDecoder.init(&buf2);
+    try testing.expectError(error.InvalidEnumValue, dec2.getEnum(TestOrdType));
+
+    // Truncated buffer still reports BufferOverflow first.
+    var empty = [_]u8{};
+    var dec3 = SbeDecoder.init(&empty);
+    try testing.expectError(error.BufferOverflow, dec3.getEnum(TestSide));
 }
 
 // --------------------------------------------------------------------------

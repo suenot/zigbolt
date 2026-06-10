@@ -230,6 +230,41 @@ pub const GroupHeader = extern struct {
 // Encode/Decode Helpers
 // ============================================================================
 
+/// Errors returned when decoding untrusted wire bytes.
+pub const DecodeError = error{
+    /// Buffer is too short for the declared message/group contents.
+    Truncated,
+    /// A group or block header is inconsistent (bad block_length, extent
+    /// overflow, ...) — the zero-copy view cannot be safely constructed.
+    InvalidGroup,
+    /// An exhaustive enum field holds a byte that is not a valid tag.
+    InvalidEnumValue,
+    /// A group entry index is out of the validated range.
+    IndexOutOfRange,
+};
+
+/// Validate every exhaustive-enum field of `T` against the raw block bytes.
+/// `block` must hold at least @sizeOf(T) bytes (the fixed block of a message
+/// or a single group entry). Returns error.InvalidEnumValue if any enum field
+/// contains a byte pattern that is not a named tag — reading such a field
+/// through the zero-copy view would otherwise be illegal behavior.
+fn validateEnumFields(comptime T: type, block: []const u8) DecodeError!void {
+    if (block.len < @sizeOf(T)) return error.Truncated;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        switch (@typeInfo(f.type)) {
+            .@"enum" => |e| {
+                if (e.is_exhaustive) {
+                    const Tag = e.tag_type;
+                    const off = @offsetOf(T, f.name);
+                    const raw = std.mem.readInt(Tag, block[off..][0..@sizeOf(Tag)], .little);
+                    _ = std.meta.intToEnum(f.type, raw) catch return error.InvalidEnumValue;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 /// Encode a fixed-block message (no groups) into buf.
 /// Returns the total number of bytes written (header + block).
 fn encodeFixedMessage(comptime MsgType: type, self: *const MsgType, buf: []u8) usize {
@@ -255,12 +290,15 @@ fn DecodeResult(comptime MsgType: type) type {
 
 /// Decode a fixed-block message (no groups) from buf.
 /// Returns the header and a zero-copy pointer into the buffer.
-fn decodeFixedMessage(comptime MsgType: type, buf: []const u8) DecodeResult(MsgType) {
+/// All exhaustive-enum fields are validated before the view is handed back,
+/// so accessing any field of the result is guaranteed safe.
+fn decodeFixedMessage(comptime MsgType: type, buf: []const u8) DecodeError!DecodeResult(MsgType) {
     const total = MessageHeader.SIZE + MsgType.BLOCK_LENGTH;
-    if (buf.len < total) unreachable;
+    if (buf.len < total) return error.Truncated;
 
     const hdr: *align(1) const MessageHeader = @ptrCast(buf[0..MessageHeader.SIZE]);
     const msg: *align(1) const MsgType = @ptrCast(buf[MessageHeader.SIZE..total]);
+    try validateEnumFields(MsgType, buf[MessageHeader.SIZE..total]);
 
     return .{ .header = hdr.*, .msg = msg };
 }
@@ -307,7 +345,7 @@ pub const NewOrderSingle = extern struct {
         return encodeFixedMessage(NewOrderSingle, self, buf);
     }
 
-    pub fn decode(buf: []const u8) DecodeResult(NewOrderSingle) {
+    pub fn decode(buf: []const u8) DecodeError!DecodeResult(NewOrderSingle) {
         return decodeFixedMessage(NewOrderSingle, buf);
     }
 };
@@ -336,7 +374,7 @@ pub const OrderCancelRequest = extern struct {
         return encodeFixedMessage(OrderCancelRequest, self, buf);
     }
 
-    pub fn decode(buf: []const u8) DecodeResult(OrderCancelRequest) {
+    pub fn decode(buf: []const u8) DecodeError!DecodeResult(OrderCancelRequest) {
         return decodeFixedMessage(OrderCancelRequest, buf);
     }
 };
@@ -381,7 +419,7 @@ pub const OrderCancelReplaceRequest = extern struct {
         return encodeFixedMessage(OrderCancelReplaceRequest, self, buf);
     }
 
-    pub fn decode(buf: []const u8) DecodeResult(OrderCancelReplaceRequest) {
+    pub fn decode(buf: []const u8) DecodeError!DecodeResult(OrderCancelReplaceRequest) {
         return decodeFixedMessage(OrderCancelReplaceRequest, buf);
     }
 };
@@ -416,7 +454,7 @@ pub const ExecutionReport = extern struct {
         return encodeFixedMessage(ExecutionReport, self, buf);
     }
 
-    pub fn decode(buf: []const u8) DecodeResult(ExecutionReport) {
+    pub fn decode(buf: []const u8) DecodeError!DecodeResult(ExecutionReport) {
         return decodeFixedMessage(ExecutionReport, buf);
     }
 };
@@ -435,7 +473,7 @@ pub const Heartbeat = extern struct {
         return encodeFixedMessage(Heartbeat, self, buf);
     }
 
-    pub fn decode(buf: []const u8) DecodeResult(Heartbeat) {
+    pub fn decode(buf: []const u8) DecodeError!DecodeResult(Heartbeat) {
         return decodeFixedMessage(Heartbeat, buf);
     }
 };
@@ -457,7 +495,7 @@ pub const Logon = extern struct {
         return encodeFixedMessage(Logon, self, buf);
     }
 
-    pub fn decode(buf: []const u8) DecodeResult(Logon) {
+    pub fn decode(buf: []const u8) DecodeError!DecodeResult(Logon) {
         return decodeFixedMessage(Logon, buf);
     }
 };
@@ -477,7 +515,7 @@ pub const Logout = extern struct {
         return encodeFixedMessage(Logout, self, buf);
     }
 
-    pub fn decode(buf: []const u8) DecodeResult(Logout) {
+    pub fn decode(buf: []const u8) DecodeError!DecodeResult(Logout) {
         return decodeFixedMessage(Logout, buf);
     }
 };
@@ -563,39 +601,59 @@ pub const MarketDataIncrementalRefresh = struct {
         return offset;
     }
 
-    /// Decoded result for incremental refresh.
+    /// Decoded result for incremental refresh. Constructed only by `decode`,
+    /// which has already proven that entries 0..num_entries are in-bounds
+    /// and that every enum field holds a valid tag.
     pub const Decoded = struct {
         header: MessageHeader,
         trade_date: u16,
         num_entries: u16,
         entries_ptr: [*]align(1) const MdIncGrpEntry,
 
-        pub fn entry(self: Decoded, idx: usize) *align(1) const MdIncGrpEntry {
-            if (idx >= self.num_entries) unreachable;
+        pub fn entry(self: Decoded, idx: usize) DecodeError!*align(1) const MdIncGrpEntry {
+            if (idx >= self.num_entries) return error.IndexOutOfRange;
             return &self.entries_ptr[idx];
         }
     };
 
     /// Decode an incremental refresh message from buf.
-    pub fn decode(buf: []const u8) Decoded {
-        const min_size = MessageHeader.SIZE + MdIncRefreshRoot.BLOCK_LENGTH + GroupHeader.SIZE;
-        if (buf.len < min_size) unreachable;
-
+    /// Every wire-derived length/count is validated against the remaining
+    /// buffer before any view is constructed.
+    pub fn decode(buf: []const u8) DecodeError!Decoded {
         var offset: usize = 0;
 
         // Header
+        if (buf.len < MessageHeader.SIZE) return error.Truncated;
         const hdr: *align(1) const MessageHeader = @ptrCast(buf[offset..][0..MessageHeader.SIZE]);
         offset += MessageHeader.SIZE;
 
-        // Root block
+        // Root block: the header-declared block_length (forward compat) must
+        // cover at least our known root layout and fit in the buffer.
+        if (hdr.block_length < MdIncRefreshRoot.BLOCK_LENGTH) return error.InvalidGroup;
+        if (buf.len - offset < hdr.block_length) return error.Truncated;
         const root: *align(1) const MdIncRefreshRoot = @ptrCast(buf[offset..][0..MdIncRefreshRoot.BLOCK_LENGTH]);
-        offset += hdr.block_length; // use header's block_length for forward compat
+        offset += hdr.block_length;
 
         // Group header
+        if (buf.len - offset < GroupHeader.SIZE) return error.Truncated;
         const grp_hdr: *align(1) const GroupHeader = @ptrCast(buf[offset..][0..GroupHeader.SIZE]);
         offset += GroupHeader.SIZE;
 
-        // Entries pointer
+        // Entries: the zero-copy [*]Entry view strides by @sizeOf(Entry), so
+        // the wire block_length must match exactly, and the full extent
+        // (overflow-checked multiply) must lie within the buffer.
+        if (grp_hdr.block_length != MdIncGrpEntry.BLOCK_LENGTH) return error.InvalidGroup;
+        const entries_bytes = std.math.mul(usize, grp_hdr.num_in_group, MdIncGrpEntry.BLOCK_LENGTH) catch
+            return error.InvalidGroup;
+        if (entries_bytes > buf.len - offset) return error.Truncated;
+
+        // Validate enum fields of every entry up front so entry() access is safe.
+        var i: usize = 0;
+        while (i < grp_hdr.num_in_group) : (i += 1) {
+            const entry_off = offset + i * @as(usize, MdIncGrpEntry.BLOCK_LENGTH);
+            try validateEnumFields(MdIncGrpEntry, buf[entry_off..][0..MdIncGrpEntry.BLOCK_LENGTH]);
+        }
+
         const entries_ptr: [*]align(1) const MdIncGrpEntry = @ptrCast(buf[offset..].ptr);
 
         return .{
@@ -685,6 +743,8 @@ pub const MarketDataSnapshotFullRefresh = struct {
         return offset;
     }
 
+    /// Decoded result. Constructed only by `decode`, which has already proven
+    /// that entries 0..num_entries are in-bounds and enum fields are valid.
     pub const Decoded = struct {
         header: MessageHeader,
         security_id: u64,
@@ -693,26 +753,40 @@ pub const MarketDataSnapshotFullRefresh = struct {
         num_entries: u16,
         entries_ptr: [*]align(1) const MdFullGrpEntry,
 
-        pub fn entry(self: Decoded, idx: usize) *align(1) const MdFullGrpEntry {
-            if (idx >= self.num_entries) unreachable;
+        pub fn entry(self: Decoded, idx: usize) DecodeError!*align(1) const MdFullGrpEntry {
+            if (idx >= self.num_entries) return error.IndexOutOfRange;
             return &self.entries_ptr[idx];
         }
     };
 
-    pub fn decode(buf: []const u8) Decoded {
-        const min_size = MessageHeader.SIZE + MdSnapRefreshRoot.BLOCK_LENGTH + GroupHeader.SIZE;
-        if (buf.len < min_size) unreachable;
-
+    /// Decode a full refresh snapshot from buf, validating every wire-derived
+    /// length/count against the remaining buffer before constructing views.
+    pub fn decode(buf: []const u8) DecodeError!Decoded {
         var offset: usize = 0;
 
+        if (buf.len < MessageHeader.SIZE) return error.Truncated;
         const hdr: *align(1) const MessageHeader = @ptrCast(buf[offset..][0..MessageHeader.SIZE]);
         offset += MessageHeader.SIZE;
 
+        if (hdr.block_length < MdSnapRefreshRoot.BLOCK_LENGTH) return error.InvalidGroup;
+        if (buf.len - offset < hdr.block_length) return error.Truncated;
         const root: *align(1) const MdSnapRefreshRoot = @ptrCast(buf[offset..][0..MdSnapRefreshRoot.BLOCK_LENGTH]);
         offset += hdr.block_length;
 
+        if (buf.len - offset < GroupHeader.SIZE) return error.Truncated;
         const grp_hdr: *align(1) const GroupHeader = @ptrCast(buf[offset..][0..GroupHeader.SIZE]);
         offset += GroupHeader.SIZE;
+
+        if (grp_hdr.block_length != MdFullGrpEntry.BLOCK_LENGTH) return error.InvalidGroup;
+        const entries_bytes = std.math.mul(usize, grp_hdr.num_in_group, MdFullGrpEntry.BLOCK_LENGTH) catch
+            return error.InvalidGroup;
+        if (entries_bytes > buf.len - offset) return error.Truncated;
+
+        var i: usize = 0;
+        while (i < grp_hdr.num_in_group) : (i += 1) {
+            const entry_off = offset + i * @as(usize, MdFullGrpEntry.BLOCK_LENGTH);
+            try validateEnumFields(MdFullGrpEntry, buf[entry_off..][0..MdFullGrpEntry.BLOCK_LENGTH]);
+        }
 
         const entries_ptr: [*]align(1) const MdFullGrpEntry = @ptrCast(buf[offset..].ptr);
 
@@ -839,7 +913,47 @@ pub const MassQuote = struct {
         return offset;
     }
 
+    /// A validated view of one quote set within the group data.
+    const QuoteSetView = struct {
+        set: *align(1) const QuoteSetEntry,
+        num_entries: u16,
+        entries_offset: usize,
+        next_offset: usize,
+    };
+
+    /// Validate and view the quote set starting at `start` within `data`.
+    /// Requires start <= data.len (maintained inductively by callers).
+    /// Checks the set block, the nested group header, the entry stride and
+    /// the full entries extent (overflow-checked multiply) before returning.
+    fn viewQuoteSetAt(data: []const u8, start: usize) DecodeError!QuoteSetView {
+        var offset = start;
+
+        if (data.len - offset < QuoteSetEntry.BLOCK_LENGTH) return error.Truncated;
+        const set: *align(1) const QuoteSetEntry = @ptrCast(data[offset..][0..QuoteSetEntry.BLOCK_LENGTH]);
+        offset += QuoteSetEntry.BLOCK_LENGTH;
+
+        if (data.len - offset < GroupHeader.SIZE) return error.Truncated;
+        const ehdr: *align(1) const GroupHeader = @ptrCast(data[offset..][0..GroupHeader.SIZE]);
+        offset += GroupHeader.SIZE;
+
+        // The zero-copy [*]QuoteEntry view strides by @sizeOf(QuoteEntry),
+        // so the wire block_length must match exactly.
+        if (ehdr.block_length != QuoteEntry.BLOCK_LENGTH) return error.InvalidGroup;
+        const entries_bytes = std.math.mul(usize, ehdr.num_in_group, ehdr.block_length) catch
+            return error.InvalidGroup;
+        if (entries_bytes > data.len - offset) return error.Truncated;
+
+        return .{
+            .set = set,
+            .num_entries = ehdr.num_in_group,
+            .entries_offset = offset,
+            .next_offset = offset + entries_bytes,
+        };
+    }
+
     /// Decoded MassQuote result. Provides methods to iterate nested groups.
+    /// `decode` has already walked and validated the full nested structure,
+    /// so well-indexed access through this view cannot go out of bounds.
     pub const Decoded = struct {
         header: MessageHeader,
         root: *align(1) const MassQuoteRoot,
@@ -852,65 +966,70 @@ pub const MassQuote = struct {
             num_entries: u16,
             entries_ptr: [*]align(1) const QuoteEntry,
 
-            pub fn entry(self: QuoteSetDecoded, idx: usize) *align(1) const QuoteEntry {
-                if (idx >= self.num_entries) unreachable;
+            pub fn entry(self: QuoteSetDecoded, idx: usize) DecodeError!*align(1) const QuoteEntry {
+                if (idx >= self.num_entries) return error.IndexOutOfRange;
                 return &self.entries_ptr[idx];
             }
         };
 
-        /// Iterate over quote sets by index. Must be called in order (0, 1, 2, ...).
-        /// For simplicity, re-walks from the start each time.
-        pub fn quoteSet(self: Decoded, set_idx: usize) QuoteSetDecoded {
-            if (set_idx >= self.num_quote_sets) unreachable;
+        /// View quote set `set_idx`. Re-walks (with full bounds re-validation)
+        /// from the start of the group data each time.
+        pub fn quoteSet(self: Decoded, set_idx: usize) DecodeError!QuoteSetDecoded {
+            if (set_idx >= self.num_quote_sets) return error.IndexOutOfRange;
 
             var offset: usize = 0;
             var i: usize = 0;
             while (i < set_idx) : (i += 1) {
-                // Skip set block
-                offset += QuoteSetEntry.BLOCK_LENGTH;
-                // Read entries group header
-                const ehdr: *align(1) const GroupHeader = @ptrCast(self.group_data[offset..][0..GroupHeader.SIZE]);
-                offset += GroupHeader.SIZE;
-                // Skip entries
-                offset += @as(usize, ehdr.num_in_group) * ehdr.block_length;
+                const skipped = try viewQuoteSetAt(self.group_data, offset);
+                offset = skipped.next_offset;
             }
 
-            const set: *align(1) const QuoteSetEntry = @ptrCast(self.group_data[offset..][0..QuoteSetEntry.BLOCK_LENGTH]);
-            offset += QuoteSetEntry.BLOCK_LENGTH;
-
-            const ehdr: *align(1) const GroupHeader = @ptrCast(self.group_data[offset..][0..GroupHeader.SIZE]);
-            offset += GroupHeader.SIZE;
-
-            const entries_ptr: [*]align(1) const QuoteEntry = @ptrCast(self.group_data[offset..].ptr);
+            const view = try viewQuoteSetAt(self.group_data, offset);
+            const entries_ptr: [*]align(1) const QuoteEntry = @ptrCast(self.group_data[view.entries_offset..].ptr);
 
             return .{
-                .set = set,
-                .num_entries = ehdr.num_in_group,
+                .set = view.set,
+                .num_entries = view.num_entries,
                 .entries_ptr = entries_ptr,
             };
         }
     };
 
-    pub fn decode(buf: []const u8) Decoded {
-        const min_size = MessageHeader.SIZE + MassQuoteRoot.BLOCK_LENGTH + GroupHeader.SIZE;
-        if (buf.len < min_size) unreachable;
-
+    /// Decode a MassQuote from buf. Walks the entire nested group structure
+    /// up front so that every quote set and entry is proven in-bounds before
+    /// any view is handed back.
+    pub fn decode(buf: []const u8) DecodeError!Decoded {
         var offset: usize = 0;
 
+        if (buf.len < MessageHeader.SIZE) return error.Truncated;
         const hdr: *align(1) const MessageHeader = @ptrCast(buf[offset..][0..MessageHeader.SIZE]);
         offset += MessageHeader.SIZE;
 
+        if (hdr.block_length < MassQuoteRoot.BLOCK_LENGTH) return error.InvalidGroup;
+        if (buf.len - offset < hdr.block_length) return error.Truncated;
         const root: *align(1) const MassQuoteRoot = @ptrCast(buf[offset..][0..MassQuoteRoot.BLOCK_LENGTH]);
         offset += hdr.block_length;
 
+        if (buf.len - offset < GroupHeader.SIZE) return error.Truncated;
         const sets_hdr: *align(1) const GroupHeader = @ptrCast(buf[offset..][0..GroupHeader.SIZE]);
         offset += GroupHeader.SIZE;
+
+        const group_data = buf[offset..];
+
+        // Pre-walk all quote sets: proves the entire nested structure
+        // (set blocks, nested headers, entry extents) lies within the buffer.
+        var walk: usize = 0;
+        var s: usize = 0;
+        while (s < sets_hdr.num_in_group) : (s += 1) {
+            const view = try viewQuoteSetAt(group_data, walk);
+            walk = view.next_offset;
+        }
 
         return .{
             .header = hdr.*,
             .root = root,
             .num_quote_sets = sets_hdr.num_in_group,
-            .group_data = buf[offset..],
+            .group_data = group_data,
         };
     }
 };
@@ -1051,7 +1170,7 @@ test "NewOrderSingle — encode/decode roundtrip" {
     try testing.expect(written > 0);
     try testing.expectEqual(MessageHeader.SIZE + NewOrderSingle.BLOCK_LENGTH, written);
 
-    const decoded = NewOrderSingle.decode(buf[0..written]);
+    const decoded = try NewOrderSingle.decode(buf[0..written]);
     try testing.expectEqual(@as(u16, 68), decoded.header.template_id);
     try testing.expectEqual(SCHEMA_ID, decoded.header.schema_id);
     try testing.expect(decoded.msg.account.eql("ACCT001"));
@@ -1089,7 +1208,7 @@ test "ExecutionReport — encode/decode roundtrip" {
     const written = msg.encode(&buf);
     try testing.expect(written > 0);
 
-    const decoded = ExecutionReport.decode(buf[0..written]);
+    const decoded = try ExecutionReport.decode(buf[0..written]);
     try testing.expectEqual(@as(u16, 56), decoded.header.template_id);
     try testing.expectEqual(@as(i64, 12345678), decoded.msg.order_id);
     try testing.expectEqual(ExecType.fill, decoded.msg.exec_type);
@@ -1148,18 +1267,18 @@ test "MarketDataIncrementalRefresh — 3 entries encode/decode" {
     const written = MarketDataIncrementalRefresh.encode(19876, &entries, &buf);
     try testing.expect(written > 0);
 
-    const decoded = MarketDataIncrementalRefresh.decode(buf[0..written]);
+    const decoded = try MarketDataIncrementalRefresh.decode(buf[0..written]);
     try testing.expectEqual(@as(u16, 88), decoded.header.template_id);
     try testing.expectEqual(@as(u16, 19876), decoded.trade_date);
     try testing.expectEqual(@as(u16, 3), decoded.num_entries);
 
-    const e0 = decoded.entry(0);
+    const e0 = try decoded.entry(0);
     try testing.expectEqual(MDUpdateAction.new, e0.md_update_action);
     try testing.expectEqual(MDEntryType.bid, e0.md_entry_type);
     try testing.expectEqual(@as(u64, 100001), e0.security_id);
     try testing.expectEqual(@as(i32, 1000), e0.md_entry_size);
 
-    const e2 = decoded.entry(2);
+    const e2 = try decoded.entry(2);
     try testing.expectEqual(MDUpdateAction.change, e2.md_update_action);
     try testing.expectEqual(@as(u8, 2), e2.md_price_level);
 }
@@ -1228,24 +1347,24 @@ test "MassQuote — nested groups encode/decode" {
     const written = MassQuote.encode(root, &quote_sets, &buf);
     try testing.expect(written > 0);
 
-    const decoded = MassQuote.decode(buf[0..written]);
+    const decoded = try MassQuote.decode(buf[0..written]);
     try testing.expectEqual(@as(u16, 105), decoded.header.template_id);
     try testing.expect(decoded.root.quote_req_id.eql("REQ-001"));
     try testing.expect(decoded.root.quote_id.eql("Q001"));
     try testing.expectEqual(@as(u16, 2), decoded.num_quote_sets);
 
     // Set 0: 2 entries
-    const set0 = decoded.quoteSet(0);
+    const set0 = try decoded.quoteSet(0);
     try testing.expect(set0.set.quote_set_id.eql("ES"));
     try testing.expectEqual(@as(u16, 2), set0.num_entries);
-    try testing.expect(set0.entry(0).symbol.eql("ESH4"));
-    try testing.expect(set0.entry(1).symbol.eql("ESM4"));
+    try testing.expect((try set0.entry(0)).symbol.eql("ESH4"));
+    try testing.expect((try set0.entry(1)).symbol.eql("ESM4"));
 
     // Set 1: 1 entry
-    const set1 = decoded.quoteSet(1);
+    const set1 = try decoded.quoteSet(1);
     try testing.expect(set1.set.quote_set_id.eql("NQ"));
     try testing.expectEqual(@as(u16, 1), set1.num_entries);
-    try testing.expect(set1.entry(0).symbol.eql("NQH4"));
+    try testing.expect((try set1.entry(0)).symbol.eql("NQH4"));
 }
 
 test "Heartbeat — encode/decode roundtrip" {
@@ -1254,7 +1373,7 @@ test "Heartbeat — encode/decode roundtrip" {
     const written = msg.encode(&buf);
     try testing.expect(written > 0);
 
-    const decoded = Heartbeat.decode(buf[0..written]);
+    const decoded = try Heartbeat.decode(buf[0..written]);
     try testing.expectEqual(@as(u16, 48), decoded.header.template_id);
     try testing.expectEqual(@as(u64, 1_700_000_000_000_000_000), decoded.msg.timestamp);
 }
@@ -1270,7 +1389,7 @@ test "Logon — encode/decode roundtrip" {
     const written = msg.encode(&buf);
     try testing.expect(written > 0);
 
-    const decoded = Logon.decode(buf[0..written]);
+    const decoded = try Logon.decode(buf[0..written]);
     try testing.expectEqual(@as(u16, 65), decoded.header.template_id);
     try testing.expectEqual(@as(u32, 30), decoded.msg.heart_bt_int);
     try testing.expect(decoded.msg.username.eql("trader01"));
@@ -1287,8 +1406,272 @@ test "Logout — encode/decode roundtrip" {
     const written = msg.encode(&buf);
     try testing.expect(written > 0);
 
-    const decoded = Logout.decode(buf[0..written]);
+    const decoded = try Logout.decode(buf[0..written]);
     try testing.expectEqual(@as(u16, 53), decoded.header.template_id);
     try testing.expectEqual(@as(u8, 4), decoded.msg.session_status);
     try testing.expect(decoded.msg.text.eql("Session ended"));
+}
+
+// ============================================================================
+// Hostile-input tests — crafted/corrupted wire bytes must yield errors,
+// never panics or out-of-bounds reads.
+// ============================================================================
+
+fn testNewOrderSingle() NewOrderSingle {
+    return .{
+        .account = String12.fromSlice("ACCT001"),
+        .cl_ord_id = String20.fromSlice("ORD-1"),
+        .hand_inst = .automated,
+        .cust_order_handling_inst = 0,
+        .order_qty = 100,
+        .ord_type = .limit,
+        .price_mantissa = 0,
+        .side = .buy,
+        .symbol = String6.fromSlice("AAPL"),
+        .time_in_force = .day,
+        .transact_time = 0,
+        .manual_order_indicator = .false_val,
+        .alloc_account = String10.empty(),
+        .stop_px_mantissa = 0,
+        .security_desc = String20.empty(),
+        .min_qty = 0,
+        .security_type = String3.empty(),
+        .customer_or_firm = .customer,
+        .max_show = 0,
+        .expire_date = 0,
+        .self_match_prevention_id = String12.empty(),
+        .cti_code = 0,
+        .give_up_firm = String3.empty(),
+        .cmta_giveup_cd = String2.empty(),
+        .correlation_cl_ord_id = String20.empty(),
+    };
+}
+
+fn testMdIncEntry() MdIncGrpEntry {
+    return .{
+        .md_update_action = .new,
+        .md_price_level = 1,
+        .md_entry_type = .bid,
+        .security_id = 1,
+        .rpt_seq = 1,
+        .md_entry_px_mantissa = 0,
+        .number_of_orders = 1,
+        .md_entry_time = 0,
+        .md_entry_size = 1,
+        .aggressor_side = .buy,
+        .trade_id = 0,
+    };
+}
+
+/// Encode a minimal valid MassQuote (1 quote set, 1 quote entry) into buf.
+fn encodeTestMassQuote(buf: []u8) usize {
+    const root = MassQuoteRoot{
+        .quote_req_id = String23.fromSlice("REQ"),
+        .quote_id = String10.fromSlice("Q1"),
+        .mm_account = String12.fromSlice("MM"),
+    };
+    const entries = [_]QuoteEntry{.{
+        .quote_entry_id = String10.fromSlice("QE1"),
+        .symbol = String6.fromSlice("ES"),
+        .security_desc = String20.empty(),
+        .bid_px_mantissa = 1,
+        .bid_size = 1,
+        .offer_px_mantissa = 2,
+        .offer_size = 1,
+        .transact_time = 0,
+    }};
+    const quote_sets = [_]QuoteSetWithEntries{.{
+        .set = .{
+            .quote_set_id = String3.fromSlice("ES"),
+            .underlying_security_desc = String20.empty(),
+        },
+        .entries = &entries,
+    }};
+    return MassQuote.encode(root, &quote_sets, buf);
+}
+
+test "decodeFixedMessage — truncated buffer returns error.Truncated" {
+    const msg = Heartbeat{ .timestamp = 1 };
+    var buf: [64]u8 = undefined;
+    const written = msg.encode(&buf);
+    try testing.expect(written > 0);
+
+    try testing.expectError(error.Truncated, Heartbeat.decode(buf[0 .. written - 1]));
+    try testing.expectError(error.Truncated, Heartbeat.decode(buf[0..0]));
+    try testing.expectError(error.Truncated, NewOrderSingle.decode(buf[0..written]));
+}
+
+test "decodeFixedMessage — invalid Side byte returns error.InvalidEnumValue" {
+    var buf: [1024]u8 = undefined;
+    const written = testNewOrderSingle().encode(&buf);
+    try testing.expect(written > 0);
+
+    // 0 is not a valid Side tag (buy=1, sell=2).
+    buf[MessageHeader.SIZE + @offsetOf(NewOrderSingle, "side")] = 0;
+    try testing.expectError(error.InvalidEnumValue, NewOrderSingle.decode(buf[0..written]));
+}
+
+test "decodeFixedMessage — invalid HandInst byte returns error.InvalidEnumValue" {
+    var buf: [1024]u8 = undefined;
+    const written = testNewOrderSingle().encode(&buf);
+    try testing.expect(written > 0);
+
+    // HandInst has exactly one valid tag (automated = 49).
+    buf[MessageHeader.SIZE + @offsetOf(NewOrderSingle, "hand_inst")] = 0x37;
+    try testing.expectError(error.InvalidEnumValue, NewOrderSingle.decode(buf[0..written]));
+}
+
+test "decodeFixedMessage — invalid ExecType byte returns error.InvalidEnumValue" {
+    var buf: [1024]u8 = undefined;
+    const msg = ExecutionReport{
+        .order_id = 1,
+        .cl_ord_id = String20.empty(),
+        .orig_cl_ord_id = String20.empty(),
+        .exec_type = .new,
+        .ord_status = .new,
+        .symbol = String6.empty(),
+        .side = .buy,
+        .leaves_qty = 0,
+        .cum_qty = 0,
+        .avg_px_mantissa = 0,
+        .transact_time = 0,
+        .price_mantissa = 0,
+        .order_qty = 0,
+        .security_desc = String20.empty(),
+        .security_type = String3.empty(),
+        .last_qty = 0,
+        .last_px_mantissa = 0,
+    };
+    const written = msg.encode(&buf);
+    buf[MessageHeader.SIZE + @offsetOf(ExecutionReport, "exec_type")] = 0xFF;
+    try testing.expectError(error.InvalidEnumValue, ExecutionReport.decode(buf[0..written]));
+}
+
+test "MarketDataIncrementalRefresh — hostile num_in_group (0xFFFF) is rejected" {
+    const entries = [_]MdIncGrpEntry{testMdIncEntry()};
+    var buf: [4096]u8 = undefined;
+    const written = MarketDataIncrementalRefresh.encode(1, &entries, &buf);
+    try testing.expect(written > 0);
+
+    // Forge num_in_group = 0xFFFF while the buffer only holds one entry.
+    const grp_off = MessageHeader.SIZE + MdIncRefreshRoot.BLOCK_LENGTH;
+    std.mem.writeInt(u16, buf[grp_off + 2 ..][0..2], 0xFFFF, .little);
+    try testing.expectError(error.Truncated, MarketDataIncrementalRefresh.decode(buf[0..written]));
+}
+
+test "MarketDataIncrementalRefresh — truncated buffers are rejected" {
+    var tiny = [_]u8{0} ** 4; // shorter than the message header
+    try testing.expectError(error.Truncated, MarketDataIncrementalRefresh.decode(&tiny));
+
+    // Valid header but root block_length pointing far past the buffer.
+    var buf: [32]u8 = [_]u8{0} ** 32;
+    std.mem.writeInt(u16, buf[0..2], 0xFFFF, .little); // block_length
+    std.mem.writeInt(u16, buf[2..4], MarketDataIncrementalRefresh.TEMPLATE_ID, .little);
+    try testing.expectError(error.Truncated, MarketDataIncrementalRefresh.decode(&buf));
+}
+
+test "MarketDataIncrementalRefresh — mismatched group block_length is rejected" {
+    const entries = [_]MdIncGrpEntry{testMdIncEntry()};
+    var buf: [4096]u8 = undefined;
+    const written = MarketDataIncrementalRefresh.encode(1, &entries, &buf);
+
+    const grp_off = MessageHeader.SIZE + MdIncRefreshRoot.BLOCK_LENGTH;
+    std.mem.writeInt(u16, buf[grp_off..][0..2], 1, .little); // bogus entry stride
+    try testing.expectError(error.InvalidGroup, MarketDataIncrementalRefresh.decode(buf[0..written]));
+}
+
+test "MarketDataIncrementalRefresh — invalid entry enum byte is rejected" {
+    const entries = [_]MdIncGrpEntry{testMdIncEntry()};
+    var buf: [4096]u8 = undefined;
+    const written = MarketDataIncrementalRefresh.encode(1, &entries, &buf);
+
+    const entry_off = MessageHeader.SIZE + MdIncRefreshRoot.BLOCK_LENGTH + GroupHeader.SIZE;
+    buf[entry_off + @offsetOf(MdIncGrpEntry, "md_update_action")] = 99;
+    try testing.expectError(error.InvalidEnumValue, MarketDataIncrementalRefresh.decode(buf[0..written]));
+}
+
+test "MarketDataIncrementalRefresh — entry index out of range returns error" {
+    const entries = [_]MdIncGrpEntry{testMdIncEntry()};
+    var buf: [4096]u8 = undefined;
+    const written = MarketDataIncrementalRefresh.encode(1, &entries, &buf);
+
+    const decoded = try MarketDataIncrementalRefresh.decode(buf[0..written]);
+    try testing.expectEqual(@as(u16, 1), decoded.num_entries);
+    try testing.expectError(error.IndexOutOfRange, decoded.entry(1));
+}
+
+test "MarketDataSnapshotFullRefresh — hostile num_in_group (0xFFFF) is rejected" {
+    const entries = [_]MdFullGrpEntry{.{
+        .md_entry_type = .bid,
+        .md_entry_px_mantissa = 1,
+        .md_entry_size = 1,
+        .number_of_orders = 1,
+    }};
+    var buf: [4096]u8 = undefined;
+    const written = MarketDataSnapshotFullRefresh.encode(1, String6.fromSlice("ES"), 0, &entries, &buf);
+    try testing.expect(written > 0);
+
+    const grp_off = MessageHeader.SIZE + MdSnapRefreshRoot.BLOCK_LENGTH;
+    std.mem.writeInt(u16, buf[grp_off + 2 ..][0..2], 0xFFFF, .little);
+    try testing.expectError(error.Truncated, MarketDataSnapshotFullRefresh.decode(buf[0..written]));
+
+    var tiny = [_]u8{0} ** 6;
+    try testing.expectError(error.Truncated, MarketDataSnapshotFullRefresh.decode(&tiny));
+}
+
+test "MassQuote — hostile nested num_in_group (0xFFFF) is rejected" {
+    var buf: [4096]u8 = undefined;
+    const written = encodeTestMassQuote(&buf);
+    try testing.expect(written > 0);
+
+    // Nested QuoteEntries group header lives after: msg hdr | root | sets hdr | set block.
+    const nested_off = MessageHeader.SIZE + MassQuoteRoot.BLOCK_LENGTH +
+        GroupHeader.SIZE + QuoteSetEntry.BLOCK_LENGTH;
+    std.mem.writeInt(u16, buf[nested_off + 2 ..][0..2], 0xFFFF, .little);
+    try testing.expectError(error.Truncated, MassQuote.decode(buf[0..written]));
+}
+
+test "MassQuote — nested block_length * num_in_group jump is rejected" {
+    var buf: [4096]u8 = undefined;
+    const written = encodeTestMassQuote(&buf);
+
+    // block_length = 0xFFFF and num_in_group = 0xFFFF would have jumped the
+    // walk offset by ~4.29e9 bytes in the unchecked decoder.
+    const nested_off = MessageHeader.SIZE + MassQuoteRoot.BLOCK_LENGTH +
+        GroupHeader.SIZE + QuoteSetEntry.BLOCK_LENGTH;
+    std.mem.writeInt(u16, buf[nested_off..][0..2], 0xFFFF, .little);
+    std.mem.writeInt(u16, buf[nested_off + 2 ..][0..2], 0xFFFF, .little);
+    try testing.expectError(error.InvalidGroup, MassQuote.decode(buf[0..written]));
+}
+
+test "MassQuote — hostile outer num_quote_sets (0xFFFF) is rejected" {
+    var buf: [4096]u8 = undefined;
+    const written = encodeTestMassQuote(&buf);
+
+    const sets_off = MessageHeader.SIZE + MassQuoteRoot.BLOCK_LENGTH;
+    std.mem.writeInt(u16, buf[sets_off + 2 ..][0..2], 0xFFFF, .little);
+    try testing.expectError(error.Truncated, MassQuote.decode(buf[0..written]));
+}
+
+test "MassQuote — truncated buffers are rejected" {
+    var tiny = [_]u8{0} ** 7;
+    try testing.expectError(error.Truncated, MassQuote.decode(&tiny));
+
+    var buf: [4096]u8 = undefined;
+    const written = encodeTestMassQuote(&buf);
+    // Cut the last quote entry short.
+    try testing.expectError(error.Truncated, MassQuote.decode(buf[0 .. written - 1]));
+}
+
+test "MassQuote — quoteSet/entry index out of range returns error" {
+    var buf: [4096]u8 = undefined;
+    const written = encodeTestMassQuote(&buf);
+
+    const decoded = try MassQuote.decode(buf[0..written]);
+    try testing.expectEqual(@as(u16, 1), decoded.num_quote_sets);
+    try testing.expectError(error.IndexOutOfRange, decoded.quoteSet(1));
+
+    const set0 = try decoded.quoteSet(0);
+    try testing.expectEqual(@as(u16, 1), set0.num_entries);
+    try testing.expectError(error.IndexOutOfRange, set0.entry(1));
 }

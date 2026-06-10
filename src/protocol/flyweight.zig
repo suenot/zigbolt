@@ -69,6 +69,16 @@ pub const RttmFlags = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Returned when a buffer is too short to back a flyweight. The flyweights
+/// parse untrusted wire frames, so this must be a real runtime check —
+/// std.debug.assert is compiled out in ReleaseFast and would let a short
+/// frame read/write out of bounds.
+pub const WrapError = error{Truncated};
+
+// ---------------------------------------------------------------------------
 // Helper: read/write at offset (typed)
 // ---------------------------------------------------------------------------
 
@@ -91,8 +101,8 @@ pub const HeaderFlyweight = struct {
 
     pub const SIZE: usize = 8;
 
-    pub fn wrap(buf: []u8) HeaderFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn wrap(buf: []u8) WrapError!HeaderFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         return .{ .buf = buf };
     }
 
@@ -147,14 +157,14 @@ pub const DataHeaderFlyweight = struct {
 
     pub const SIZE: usize = 32;
 
-    pub fn wrap(buf: []u8) DataHeaderFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn wrap(buf: []u8) WrapError!DataHeaderFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         return .{ .buf = buf };
     }
 
     /// Wrap buffer and initialise type field to DATA.
-    pub fn init(buf: []u8) DataHeaderFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn init(buf: []u8) WrapError!DataHeaderFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         const self = DataHeaderFlyweight{ .buf = buf };
         self.header().setFrameType(@intFromEnum(FrameType.DATA));
         self.header().setVersion(0);
@@ -251,13 +261,13 @@ pub const StatusMessageFlyweight = struct {
 
     pub const SIZE: usize = 36;
 
-    pub fn wrap(buf: []u8) StatusMessageFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn wrap(buf: []u8) WrapError!StatusMessageFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         return .{ .buf = buf };
     }
 
-    pub fn init(buf: []u8) StatusMessageFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn init(buf: []u8) WrapError!StatusMessageFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         const self = StatusMessageFlyweight{ .buf = buf };
         self.header().setFrameType(@intFromEnum(FrameType.SM));
         self.header().setVersion(0);
@@ -327,13 +337,13 @@ pub const NakFlyweight = struct {
 
     pub const SIZE: usize = 28;
 
-    pub fn wrap(buf: []u8) NakFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn wrap(buf: []u8) WrapError!NakFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         return .{ .buf = buf };
     }
 
-    pub fn init(buf: []u8) NakFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn init(buf: []u8) WrapError!NakFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         const self = NakFlyweight{ .buf = buf };
         self.header().setFrameType(@intFromEnum(FrameType.NAK));
         self.header().setVersion(0);
@@ -395,13 +405,13 @@ pub const SetupFlyweight = struct {
 
     pub const SIZE: usize = 40;
 
-    pub fn wrap(buf: []u8) SetupFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn wrap(buf: []u8) WrapError!SetupFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         return .{ .buf = buf };
     }
 
-    pub fn init(buf: []u8) SetupFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn init(buf: []u8) WrapError!SetupFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         const self = SetupFlyweight{ .buf = buf };
         self.header().setFrameType(@intFromEnum(FrameType.SETUP));
         self.header().setVersion(0);
@@ -487,13 +497,13 @@ pub const RttMeasurementFlyweight = struct {
 
     pub const SIZE: usize = 40;
 
-    pub fn wrap(buf: []u8) RttMeasurementFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn wrap(buf: []u8) WrapError!RttMeasurementFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         return .{ .buf = buf };
     }
 
-    pub fn init(buf: []u8) RttMeasurementFlyweight {
-        std.debug.assert(buf.len >= SIZE);
+    pub fn init(buf: []u8) WrapError!RttMeasurementFlyweight {
+        if (buf.len < SIZE) return error.Truncated;
         const self = RttMeasurementFlyweight{ .buf = buf };
         self.header().setFrameType(@intFromEnum(FrameType.RTTM));
         self.header().setVersion(0);
@@ -561,13 +571,13 @@ pub const ErrorFlyweight = struct {
     ///               + error_code(4) + error_string_length(4) = 28
     pub const MIN_SIZE: usize = 28;
 
-    pub fn wrap(buf: []u8) ErrorFlyweight {
-        std.debug.assert(buf.len >= MIN_SIZE);
+    pub fn wrap(buf: []u8) WrapError!ErrorFlyweight {
+        if (buf.len < MIN_SIZE) return error.Truncated;
         return .{ .buf = buf };
     }
 
-    pub fn init(buf: []u8) ErrorFlyweight {
-        std.debug.assert(buf.len >= MIN_SIZE);
+    pub fn init(buf: []u8) WrapError!ErrorFlyweight {
+        if (buf.len < MIN_SIZE) return error.Truncated;
         const self = ErrorFlyweight{ .buf = buf };
         self.header().setFrameType(@intFromEnum(FrameType.ERR));
         self.header().setVersion(0);
@@ -639,6 +649,11 @@ pub const ErrorFlyweight = struct {
 // ---------------------------------------------------------------------------
 
 /// Compute the absolute stream position from term-based addressing.
+///
+/// `position_bits_to_shift` and `term_id` may come straight off the wire:
+/// clamp the shift (an i64 shift of >= 64 panics / is UB) and use
+/// saturating shift/add so hostile values pin at i64 max/min instead of
+/// overflowing into a panic.
 pub fn computePosition(
     term_offset: i32,
     term_id: i32,
@@ -646,29 +661,33 @@ pub fn computePosition(
     initial_term_id: i32,
 ) i64 {
     const term_count: i64 = @as(i64, term_id) - @as(i64, initial_term_id);
-    const shift: u6 = @intCast(position_bits_to_shift);
-    return (term_count << shift) + @as(i64, term_offset);
+    const shift: u6 = @intCast(@min(position_bits_to_shift, 63));
+    return (term_count <<| shift) +| @as(i64, term_offset);
 }
 
 /// Compute term_id from an absolute position.
+/// The shift is clamped and the final narrowing wraps instead of panicking
+/// so a hostile shift/position combination cannot crash the process.
 pub fn computeTermIdFromPosition(
     position: i64,
     position_bits_to_shift: u8,
     initial_term_id: i32,
 ) i32 {
-    const shift: u6 = @intCast(position_bits_to_shift);
+    const shift: u6 = @intCast(@min(position_bits_to_shift, 63));
     const term_count = position >> shift;
-    return @intCast(term_count + @as(i64, initial_term_id));
+    return @truncate(term_count + @as(i64, initial_term_id));
 }
 
 /// Compute term_offset from an absolute position.
+/// The shift is clamped and the final narrowing wraps instead of panicking
+/// so a hostile shift/position combination cannot crash the process.
 pub fn computeTermOffsetFromPosition(
     position: i64,
     position_bits_to_shift: u8,
 ) i32 {
-    const shift: u6 = @intCast(position_bits_to_shift);
-    const mask = (@as(i64, 1) << shift) - 1;
-    return @intCast(position & mask);
+    const shift: u6 = @intCast(@min(position_bits_to_shift, 63));
+    const mask: i64 = @bitCast((@as(u64, 1) << shift) - 1);
+    return @truncate(position & mask);
 }
 
 /// Compute term count (number of terms elapsed since initial).
@@ -710,7 +729,7 @@ test "ErrorFlyweight min size is 28 bytes" {
 
 test "DataHeader encode/decode roundtrip" {
     var buf: [64]u8 = @splat(0);
-    const dh = DataHeaderFlyweight.init(&buf);
+    const dh = try DataHeaderFlyweight.init(&buf);
 
     dh.setFrameLength(64);
     dh.setSessionId(0x12345678);
@@ -733,7 +752,7 @@ test "DataHeader encode/decode roundtrip" {
 
 test "DataHeader flags BEGIN, END, EOS" {
     var buf: [32]u8 = @splat(0);
-    const dh = DataHeaderFlyweight.init(&buf);
+    const dh = try DataHeaderFlyweight.init(&buf);
 
     dh.setFlags(DataFlags.BEGIN | DataFlags.END);
     try std.testing.expect(dh.isBeginMessage());
@@ -748,7 +767,7 @@ test "DataHeader flags BEGIN, END, EOS" {
 
 test "DataHeader payload slice" {
     var buf: [48]u8 = @splat(0);
-    const dh = DataHeaderFlyweight.init(&buf);
+    const dh = try DataHeaderFlyweight.init(&buf);
     dh.setFrameLength(48);
 
     const pl = dh.payload();
@@ -761,7 +780,7 @@ test "DataHeader payload slice" {
 
 test "StatusMessage encode/decode roundtrip" {
     var buf: [36]u8 = @splat(0);
-    const sm = StatusMessageFlyweight.init(&buf);
+    const sm = try StatusMessageFlyweight.init(&buf);
 
     sm.setSessionId(100);
     sm.setStreamId(200);
@@ -781,7 +800,7 @@ test "StatusMessage encode/decode roundtrip" {
 
 test "NakFlyweight encode/decode roundtrip" {
     var buf: [28]u8 = @splat(0);
-    const nak = NakFlyweight.init(&buf);
+    const nak = try NakFlyweight.init(&buf);
 
     nak.setSessionId(10);
     nak.setStreamId(20);
@@ -799,7 +818,7 @@ test "NakFlyweight encode/decode roundtrip" {
 
 test "SetupFlyweight encode/decode roundtrip" {
     var buf: [40]u8 = @splat(0);
-    const setup = SetupFlyweight.init(&buf);
+    const setup = try SetupFlyweight.init(&buf);
 
     setup.setTermOffset(0);
     setup.setSessionId(0x7FFFFFFF);
@@ -823,7 +842,7 @@ test "SetupFlyweight encode/decode roundtrip" {
 
 test "RttMeasurement encode/decode roundtrip" {
     var buf: [40]u8 = @splat(0);
-    const rtt = RttMeasurementFlyweight.init(&buf);
+    const rtt = try RttMeasurementFlyweight.init(&buf);
 
     rtt.setSessionId(42);
     rtt.setStreamId(7);
@@ -864,7 +883,7 @@ test "computePosition / computeTermIdFromPosition roundtrip" {
 
 test "ErrorFlyweight with variable-length string" {
     var buf: [128]u8 = @splat(0);
-    const err = ErrorFlyweight.init(&buf);
+    const err = try ErrorFlyweight.init(&buf);
 
     err.setOffendingCommandCorrelationId(12345);
     err.setOffendingFrameLength(64);
@@ -887,11 +906,11 @@ test "frame type identification from header" {
     var buf: [40]u8 = @splat(0);
 
     // Write a SETUP frame
-    const setup = SetupFlyweight.init(&buf);
+    const setup = try SetupFlyweight.init(&buf);
     _ = setup;
 
     // Read back using just the header
-    const hdr = HeaderFlyweight.wrap(&buf);
+    const hdr = try HeaderFlyweight.wrap(&buf);
     try std.testing.expectEqual(FrameType.SETUP, hdr.frameTypeEnum().?);
     try std.testing.expectEqual(@as(u8, 0), hdr.version());
 
@@ -901,4 +920,46 @@ test "frame type identification from header" {
 
     hdr.setFrameLength(40);
     try std.testing.expect(!hdr.isPaddingFrame());
+}
+
+test "wrap rejects too-short buffers for every flyweight type" {
+    var buf: [64]u8 = @splat(0);
+
+    // One byte short of each flyweight's minimum.
+    try std.testing.expectError(error.Truncated, HeaderFlyweight.wrap(buf[0 .. HeaderFlyweight.SIZE - 1]));
+    try std.testing.expectError(error.Truncated, DataHeaderFlyweight.wrap(buf[0 .. DataHeaderFlyweight.SIZE - 1]));
+    try std.testing.expectError(error.Truncated, StatusMessageFlyweight.wrap(buf[0 .. StatusMessageFlyweight.SIZE - 1]));
+    try std.testing.expectError(error.Truncated, NakFlyweight.wrap(buf[0 .. NakFlyweight.SIZE - 1]));
+    try std.testing.expectError(error.Truncated, SetupFlyweight.wrap(buf[0 .. SetupFlyweight.SIZE - 1]));
+    try std.testing.expectError(error.Truncated, RttMeasurementFlyweight.wrap(buf[0 .. RttMeasurementFlyweight.SIZE - 1]));
+    try std.testing.expectError(error.Truncated, ErrorFlyweight.wrap(buf[0 .. ErrorFlyweight.MIN_SIZE - 1]));
+
+    // Empty buffer.
+    try std.testing.expectError(error.Truncated, HeaderFlyweight.wrap(buf[0..0]));
+
+    // init() (the writing variant) is checked too.
+    try std.testing.expectError(error.Truncated, DataHeaderFlyweight.init(buf[0..4]));
+    try std.testing.expectError(error.Truncated, SetupFlyweight.init(buf[0..0]));
+
+    // Exactly-sized buffers still wrap fine.
+    _ = try HeaderFlyweight.wrap(buf[0..HeaderFlyweight.SIZE]);
+    _ = try DataHeaderFlyweight.wrap(buf[0..DataHeaderFlyweight.SIZE]);
+    _ = try ErrorFlyweight.wrap(buf[0..ErrorFlyweight.MIN_SIZE]);
+}
+
+test "computePosition survives hostile wire shift and term ids" {
+    // A wire-supplied shift >= 64 used to panic via @intCast(u6); extreme
+    // term ids used to overflow the i64 shift. Both must now saturate.
+    const p1 = computePosition(std.math.maxInt(i32), std.math.maxInt(i32), 255, 0);
+    try std.testing.expectEqual(std.math.maxInt(i64), p1);
+
+    const p2 = computePosition(0, std.math.minInt(i32), 63, std.math.maxInt(i32));
+    try std.testing.expectEqual(std.math.minInt(i64), p2);
+
+    // Reverse helpers must also tolerate hostile shifts without panicking.
+    _ = computeTermIdFromPosition(std.math.maxInt(i64), 255, 0);
+    _ = computeTermOffsetFromPosition(std.math.maxInt(i64), 255);
+
+    // Sane inputs still produce exact results.
+    try std.testing.expectEqual(@as(i64, 5 * 65536 + 4096), computePosition(4096, 105, 16, 100));
 }

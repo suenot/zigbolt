@@ -7,9 +7,25 @@ const std = @import("std");
 // Zero-copy, comptime-generated codec for packed structs.
 // All validation happens at comptime — zero runtime overhead.
 //
+// WIRE FORMAT IS LITTLE-ENDIAN ONLY. encode/decode reinterpret the packed
+// struct's native in-memory bytes, which equal the little-endian wire layout
+// only on little-endian hosts (x86_64, aarch64, ...). A big-endian host
+// would silently produce/consume byte-swapped fields, so compilation is
+// rejected there (see the comptime guard below). Field-wise byte swapping
+// cannot be retrofitted without breaking the zero-copy decode path, which
+// returns a pointer directly into the receive buffer.
+//
 
 pub fn WireCodec(comptime T: type) type {
     // --- Comptime validation ---
+    comptime {
+        if (@import("builtin").target.cpu.arch.endian() != .little) {
+            @compileError("WireCodec wire format is little-endian-only: the zero-copy " ++
+                "encode/decode of " ++ @typeName(T) ++ " reinterprets native struct bytes " ++
+                "and would silently byte-swap every field on a big-endian host. " ++
+                "Add an explicit byte-swapping codec before targeting big-endian.");
+        }
+    }
     const info = @typeInfo(T);
     if (info != .@"struct") {
         @compileError("WireCodec requires a packed struct, got " ++ @typeName(T));
@@ -38,7 +54,8 @@ pub fn WireCodec(comptime T: type) type {
         pub const Type = T;
 
         /// Encode a message into a byte buffer.
-        /// buf must be at least wire_size bytes long.
+        /// PRECONDITION: buf.len >= wire_size (checked only in safe builds;
+        /// the output buffer is caller-owned, not wire-derived).
         pub inline fn encode(msg: *const T, buf: []u8) void {
             if (buf.len < wire_size) unreachable;
             const src = std.mem.asBytes(msg);
@@ -47,12 +64,29 @@ pub fn WireCodec(comptime T: type) type {
 
         /// Zero-copy decode: returns a pointer directly into the buffer.
         /// The returned pointer is valid as long as `buf` is alive.
+        ///
+        /// PRECONDITION: buf.len >= wire_size. The check below is an
+        /// `unreachable` — it panics in Debug but is compiled out in
+        /// ReleaseFast, where a short buffer would read out of bounds.
+        /// Callers on the hot path must length-check first (as
+        /// api/subscriber.zig does); for untrusted/unverified input use
+        /// `decodeChecked` instead.
         pub inline fn decode(buf: []const u8) *align(1) const T {
             if (buf.len < wire_size) unreachable;
             return @ptrCast(buf.ptr);
         }
 
+        /// Checked zero-copy decode for untrusted input: returns
+        /// error.Truncated instead of invoking illegal behavior when the
+        /// buffer is shorter than wire_size.
+        pub inline fn decodeChecked(buf: []const u8) error{Truncated}!*align(1) const T {
+            if (buf.len < wire_size) return error.Truncated;
+            return @ptrCast(buf.ptr);
+        }
+
         /// Mutable zero-copy decode.
+        /// PRECONDITION: buf.len >= wire_size (checked only in safe builds);
+        /// length-check first or use `decodeChecked` for untrusted input.
         pub inline fn decodeMut(buf: []u8) *align(1) T {
             if (buf.len < wire_size) unreachable;
             return @ptrCast(buf.ptr);
@@ -209,6 +243,45 @@ test "WireCodec — decode is zero-copy" {
     const decoded_addr = @intFromPtr(decoded);
     const buf_addr = @intFromPtr(&buf[0]);
     try testing.expectEqual(buf_addr, decoded_addr);
+}
+
+test "WireCodec — decodeChecked rejects short buffers" {
+    const Codec = WireCodec(TickMessage);
+
+    var buf: [Codec.wire_size]u8 = undefined;
+    @memset(&buf, 0);
+
+    try testing.expectError(error.Truncated, Codec.decodeChecked(buf[0 .. Codec.wire_size - 1]));
+    try testing.expectError(error.Truncated, Codec.decodeChecked(buf[0..0]));
+}
+
+test "WireCodec — decodeChecked roundtrip matches encode (little-endian wire)" {
+    const Codec = WireCodec(TickMessage);
+
+    const msg = TickMessage{
+        .timestamp_ns = 0x0102030405060708,
+        .symbol_id = 0xCAFEBABE,
+        .price = -42,
+        .volume = 7,
+        .side = .bid,
+    };
+
+    var buf: [Codec.wire_size]u8 = undefined;
+    Codec.encode(&msg, &buf);
+
+    // The wire format is little-endian: spot-check the first field's bytes.
+    try testing.expectEqual(@as(u8, 0x08), buf[0]);
+    try testing.expectEqual(@as(u8, 0x01), buf[7]);
+
+    const decoded = try Codec.decodeChecked(&buf);
+    try testing.expectEqual(msg.timestamp_ns, decoded.timestamp_ns);
+    try testing.expectEqual(msg.symbol_id, decoded.symbol_id);
+    try testing.expectEqual(msg.price, decoded.price);
+    try testing.expectEqual(msg.volume, decoded.volume);
+    try testing.expectEqual(msg.side, decoded.side);
+
+    // Checked and unchecked decode must agree (same zero-copy pointer).
+    try testing.expectEqual(@intFromPtr(Codec.decode(&buf)), @intFromPtr(decoded));
 }
 
 test "WireCodec — decodeMut modifies original buffer" {

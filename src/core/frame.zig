@@ -30,7 +30,16 @@ pub const FrameHeader = extern struct {
 pub const FRAME_ALIGNMENT: u32 = config.frame_alignment;
 
 /// Calculate the total aligned size of a frame (header + payload + padding).
+///
+/// Payloads larger than `MAX_PAYLOAD_SIZE` are rejected up front: for a
+/// `payload_length` near u32 max, the header add and the alignment round-up
+/// inside `alignUp` both wrap, yielding a tiny bogus length. Such payloads
+/// saturate to the largest aligned u32 so callers' capacity checks fail
+/// closed instead of under-allocating.
 pub inline fn alignedFrameLength(payload_length: u32) u32 {
+    if (payload_length > MAX_PAYLOAD_SIZE) {
+        return std.math.maxInt(u32) & ~(FRAME_ALIGNMENT - 1);
+    }
     return config.alignUp(FrameHeader.SIZE + payload_length, FRAME_ALIGNMENT);
 }
 
@@ -71,6 +80,22 @@ test "alignedFrameLength" {
     try testing.expectEqual(@as(u32, 16), alignedFrameLength(8));
     // header(8) + 9 payload = 17, aligned to 8 = 24
     try testing.expectEqual(@as(u32, 24), alignedFrameLength(9));
+}
+
+test "alignedFrameLength saturates instead of overflowing" {
+    const saturated: u32 = std.math.maxInt(u32) & ~(FRAME_ALIGNMENT - 1);
+
+    // Near-max payloads previously wrapped (header add + alignment round-up
+    // both overflow u32) into a tiny length usable for under-allocation.
+    try testing.expectEqual(saturated, alignedFrameLength(std.math.maxInt(u32)));
+    try testing.expectEqual(saturated, alignedFrameLength(std.math.maxInt(u32) - 7));
+    try testing.expectEqual(saturated, alignedFrameLength(MAX_PAYLOAD_SIZE + 1));
+
+    // The largest legal payload still computes exactly.
+    try testing.expectEqual(
+        config.alignUp(FrameHeader.SIZE + MAX_PAYLOAD_SIZE, FRAME_ALIGNMENT),
+        alignedFrameLength(MAX_PAYLOAD_SIZE),
+    );
 }
 
 test "isPaddingFrame, isDataFrame, isUncommitted" {

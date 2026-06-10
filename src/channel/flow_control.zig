@@ -57,7 +57,11 @@ pub inline fn computePosition(
     initial_term_id: i32,
 ) i64 {
     const term_count: i64 = @as(i64, term_id) - @as(i64, initial_term_id);
-    return (term_count << @intCast(position_bits_to_shift)) + @as(i64, term_offset);
+    // Status-message fields are attacker-controlled: clamp the shift (an
+    // i64 shift of >= 64 panics) and saturate so extreme term ids cannot
+    // overflow into a panic; the resulting limit simply pins at i64 max/min.
+    const shift: u6 = @intCast(@min(position_bits_to_shift, 63));
+    return (term_count <<| shift) +| @as(i64, term_offset);
 }
 
 // ── Min Flow Control ───────────────────────────────────────
@@ -106,12 +110,14 @@ pub const MinFlowControl = struct {
             initial_term_id,
         );
         const window: i64 = @as(i64, status.receiver_window_length);
+        // Saturating: position near i64 max plus a window must not overflow.
+        const limit_position = position +| window;
 
         // Update existing receiver or add new one.
         var found = false;
         for (&self.receivers) |*r| {
             if (r.active and r.receiver_id == status.receiver_id) {
-                r.last_position = position + window;
+                r.last_position = limit_position;
                 r.last_seen_ns = now_ns;
                 found = true;
                 break;
@@ -119,19 +125,28 @@ pub const MinFlowControl = struct {
         }
 
         if (!found) {
-            // Try to add a new receiver.
+            // Try to add a new receiver; when the table is full, evict the
+            // least-recently-seen entry instead of silently dropping the
+            // newcomer. Otherwise 16 stale/spoofed receiver_ids would pin
+            // the sender forever (receiver identity is NOT authenticated —
+            // see module notes; full auth is out of scope here).
+            var free_slot: ?*ReceiverState = null;
+            var oldest: *ReceiverState = &self.receivers[0];
             for (&self.receivers) |*r| {
                 if (!r.active) {
-                    r.* = .{
-                        .receiver_id = status.receiver_id,
-                        .last_position = position + window,
-                        .last_seen_ns = now_ns,
-                        .active = true,
-                    };
-                    self.receiver_count += 1;
+                    free_slot = r;
                     break;
                 }
+                if (r.last_seen_ns < oldest.last_seen_ns) oldest = r;
             }
+            const slot = free_slot orelse oldest;
+            slot.* = .{
+                .receiver_id = status.receiver_id,
+                .last_position = limit_position,
+                .last_seen_ns = now_ns,
+                .active = true,
+            };
+            if (free_slot != null) self.receiver_count += 1;
         }
 
         return self.computeMinPosition(sender_limit);
@@ -219,7 +234,7 @@ pub const MaxFlowControl = struct {
             initial_term_id,
         );
         const window: i64 = @as(i64, status.receiver_window_length);
-        return @max(position + window, position + self.receiver_window);
+        return @max(position +| window, position +| self.receiver_window);
     }
 
     /// On idle, returns `sender_position + window` — no restriction.
@@ -234,7 +249,7 @@ pub const MaxFlowControl = struct {
         _ = is_eos;
         _ = sender_limit;
 
-        return sender_position + self.receiver_window;
+        return sender_position +| self.receiver_window;
     }
 
     /// Max flow control does not require any receivers.
@@ -294,11 +309,13 @@ pub const TaggedFlowControl = struct {
             initial_term_id,
         );
         const window: i64 = @as(i64, status.receiver_window_length);
+        // Saturating: position near i64 max plus a window must not overflow.
+        const limit_position = position +| window;
 
         var found = false;
         for (&self.receivers) |*r| {
             if (r.active and r.receiver_id == status.receiver_id) {
-                r.last_position = position + window;
+                r.last_position = limit_position;
                 r.last_seen_ns = now_ns;
                 r.group_tag = group_tag;
                 found = true;
@@ -307,19 +324,27 @@ pub const TaggedFlowControl = struct {
         }
 
         if (!found) {
+            // Same eviction policy as MinFlowControl: when full, replace
+            // the least-recently-seen entry so stale registrations cannot
+            // permanently exclude live receivers.
+            var free_slot: ?*TaggedReceiverState = null;
+            var oldest: *TaggedReceiverState = &self.receivers[0];
             for (&self.receivers) |*r| {
                 if (!r.active) {
-                    r.* = .{
-                        .receiver_id = status.receiver_id,
-                        .group_tag = group_tag,
-                        .last_position = position + window,
-                        .last_seen_ns = now_ns,
-                        .active = true,
-                    };
-                    self.receiver_count += 1;
+                    free_slot = r;
                     break;
                 }
+                if (r.last_seen_ns < oldest.last_seen_ns) oldest = r;
             }
+            const slot = free_slot orelse oldest;
+            slot.* = .{
+                .receiver_id = status.receiver_id,
+                .group_tag = group_tag,
+                .last_position = limit_position,
+                .last_seen_ns = now_ns,
+                .active = true,
+            };
+            if (free_slot != null) self.receiver_count += 1;
         }
 
         return self.computeTaggedMinPosition(sender_limit);
@@ -776,6 +801,128 @@ test "TaggedFlowControl — mixed tagged and untagged receivers" {
     // Limit should be based on tagged receiver only: 1500
     try std.testing.expectEqual(@as(i64, 1500), limit);
     try std.testing.expectEqual(@as(u32, 2), fc.receiver_count);
+}
+
+test "MinFlowControl — 17th receiver evicts least-recently-seen entry" {
+    var fc = MinFlowControl{};
+
+    // Fill all 16 slots; receiver 1 is the stalest (last_seen = 1).
+    var id: i64 = 1;
+    while (id <= 16) : (id += 1) {
+        const status = ReceiverStatus{
+            .session_id = 1,
+            .stream_id = 1,
+            .consumption_term_id = 0,
+            .consumption_term_offset = 10_000,
+            .receiver_window_length = 1000,
+            .receiver_id = id,
+            .timestamp_ns = 0,
+        };
+        _ = fc.onStatusMessage(status, 0, 0, 16, @intCast(id));
+    }
+    try std.testing.expectEqual(@as(u32, 16), fc.receiver_count);
+
+    // A 17th (slow) receiver used to be silently dropped, letting 16
+    // stale/spoofed registrations stall the sender. It must now replace
+    // the stalest slot and constrain the limit.
+    const newcomer = ReceiverStatus{
+        .session_id = 1,
+        .stream_id = 1,
+        .consumption_term_id = 0,
+        .consumption_term_offset = 100,
+        .receiver_window_length = 100,
+        .receiver_id = 999,
+        .timestamp_ns = 0,
+    };
+    const limit = fc.onStatusMessage(newcomer, 0, 0, 16, 1_000_000);
+
+    try std.testing.expectEqual(@as(u32, 16), fc.receiver_count);
+    // Newcomer is the minimum: 100 + 100 = 200.
+    try std.testing.expectEqual(@as(i64, 200), limit);
+
+    // The evicted receiver (id 1) re-registering must take a slot again
+    // (now evicting the next-stalest), not vanish.
+    const evicted = ReceiverStatus{
+        .session_id = 1,
+        .stream_id = 1,
+        .consumption_term_id = 0,
+        .consumption_term_offset = 50,
+        .receiver_window_length = 100,
+        .receiver_id = 1,
+        .timestamp_ns = 0,
+    };
+    const limit2 = fc.onStatusMessage(evicted, 0, 0, 16, 1_000_001);
+    try std.testing.expectEqual(@as(i64, 150), limit2);
+}
+
+test "flow control position arithmetic saturates instead of overflowing" {
+    // computePosition with a hostile shift used to panic (@intCast of a
+    // shift >= 64); extreme term ids used to overflow the i64 shift/add.
+    const p1 = computePosition(std.math.maxInt(i32), std.math.maxInt(i32), 255, 0);
+    try std.testing.expectEqual(std.math.maxInt(i64), p1);
+
+    const p2 = computePosition(std.math.maxInt(i32), 0, 63, std.math.minInt(i32));
+    try std.testing.expectEqual(std.math.maxInt(i64), p2);
+
+    // position + window near i64 max must saturate, not panic (Min path).
+    var fc = MinFlowControl{};
+    const hostile = ReceiverStatus{
+        .session_id = 1,
+        .stream_id = 1,
+        .consumption_term_id = std.math.maxInt(i32),
+        .consumption_term_offset = std.math.maxInt(i32),
+        .receiver_window_length = std.math.maxInt(i32),
+        .receiver_id = 7,
+        .timestamp_ns = 0,
+    };
+    const limit = fc.onStatusMessage(hostile, 0, 0, 63, 1000);
+    try std.testing.expectEqual(std.math.maxInt(i64), limit);
+
+    // Max path saturates too.
+    var fc_max = MaxFlowControl{ .receiver_window = std.math.maxInt(i64) };
+    const limit_max = fc_max.onIdle(0, 0, std.math.maxInt(i64), false);
+    try std.testing.expectEqual(std.math.maxInt(i64), limit_max);
+
+    // Tagged path saturates too.
+    var fc_tagged = TaggedFlowControl{};
+    fc_tagged.required_group_tag = 1;
+    const limit_tagged = fc_tagged.onStatusMessageTagged(hostile, 1, 0, 0, 63, 1000);
+    try std.testing.expectEqual(std.math.maxInt(i64), limit_tagged);
+}
+
+test "TaggedFlowControl — full table evicts least-recently-seen entry" {
+    var fc = TaggedFlowControl{};
+    fc.required_group_tag = 5;
+
+    var id: i64 = 1;
+    while (id <= 16) : (id += 1) {
+        const status = ReceiverStatus{
+            .session_id = 1,
+            .stream_id = 1,
+            .consumption_term_id = 0,
+            .consumption_term_offset = 10_000,
+            .receiver_window_length = 1000,
+            .receiver_id = id,
+            .timestamp_ns = 0,
+        };
+        // None carry the required tag.
+        _ = fc.onStatusMessageTagged(status, 99, 0, 0, 16, @intCast(id));
+    }
+    try std.testing.expectEqual(@as(u32, 16), fc.receiver_count);
+
+    // The 17th receiver carries the required tag — it must get a slot.
+    const tagged = ReceiverStatus{
+        .session_id = 1,
+        .stream_id = 1,
+        .consumption_term_id = 0,
+        .consumption_term_offset = 300,
+        .receiver_window_length = 100,
+        .receiver_id = 999,
+        .timestamp_ns = 0,
+    };
+    const limit = fc.onStatusMessageTagged(tagged, 5, 0, 0, 16, 1_000_000);
+    try std.testing.expectEqual(@as(i64, 400), limit);
+    try std.testing.expect(fc.hasRequiredReceivers());
 }
 
 test "FlowControlConfig defaults" {

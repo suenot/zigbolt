@@ -179,8 +179,10 @@ pub const CongestionControl = struct {
         } else {
             // Congestion avoidance: linear growth.
             // Increase cwnd by mss * mss / cwnd (approximately 1 MSS per RTT).
+            // Guard the divisor: a zero cwnd (e.g. min_window configured as 0
+            // and repeated losses) must not become a divide-by-zero panic.
             const mss_u64: u64 = self.mss;
-            const increment = (mss_u64 * mss_u64) / self.cwnd;
+            const increment = (mss_u64 * mss_u64) / @max(self.cwnd, 1);
             // Ensure at least 1 byte of growth to avoid stalling.
             self.cwnd += @max(increment, 1);
         }
@@ -197,7 +199,9 @@ pub const CongestionControl = struct {
     ///   ssthresh = max(cwnd / 2, min_window)
     ///   cwnd = ssthresh
     pub fn onLoss(self: *CongestionControl) void {
-        self.ssthresh = @max(self.cwnd / 2, self.min_window);
+        // Never let cwnd collapse to 0 (a 0 cwnd both stalls the sender
+        // forever and divides by zero in the congestion-avoidance path).
+        self.ssthresh = @max(self.cwnd / 2, @max(self.min_window, 1));
         self.cwnd = self.ssthresh;
         self.in_slow_start = false;
         self.loss_count += 1;
@@ -208,8 +212,8 @@ pub const CongestionControl = struct {
     ///
     /// Reset cwnd to minimum and re-enter slow start.
     pub fn onTimeout(self: *CongestionControl) void {
-        self.ssthresh = @max(self.cwnd / 2, self.min_window);
-        self.cwnd = self.min_window;
+        self.ssthresh = @max(self.cwnd / 2, @max(self.min_window, 1));
+        self.cwnd = @max(self.min_window, 1);
         self.in_slow_start = true;
         self.total_retransmits += 1;
     }
@@ -297,7 +301,8 @@ pub const NakController = struct {
     pub fn shouldSendNak(self: *const NakController, now_ns: u64) bool {
         if (self.nak_count >= self.max_retransmits) return false;
         if (self.last_nak_time_ns == 0) return true; // Never sent one.
-        return now_ns >= self.last_nak_time_ns + self.currentDelay();
+        // Saturating add: a saturated delay near u64 max must not wrap.
+        return now_ns >= self.last_nak_time_ns +| self.currentDelay();
     }
 
     /// Record that a NAK was sent.
@@ -325,8 +330,14 @@ pub const NakController = struct {
     /// Get current delay with exponential backoff.
     ///
     /// delay = base_delay_ns * 2^backoff_multiplier
+    ///
+    /// The exponent is clamped to 63 (a u64 shift of >= 64 is illegal and
+    /// would panic for a large configured `max_backoff`), and the shift is
+    /// saturating so a large base delay caps at u64 max instead of losing
+    /// bits.
     pub fn currentDelay(self: *const NakController) u64 {
-        return self.base_delay_ns << @intCast(self.backoff_multiplier);
+        const shift: u6 = @intCast(@min(self.backoff_multiplier, 63));
+        return self.base_delay_ns <<| shift;
     }
 };
 
@@ -607,6 +618,64 @@ test "window never goes below minimum" {
         cc.onTimeout();
     }
     try std.testing.expectEqual(@as(u64, 4096), cc.cwnd);
+}
+
+test "congestion window cannot divide by zero after repeated losses" {
+    // A min_window of 0 (misconfiguration or hostile config source) used to
+    // drive cwnd to 0 via onLoss/onTimeout, after which the congestion-
+    // avoidance increment (mss*mss)/cwnd panicked with a division by zero.
+    var cc = CongestionControl.init(.{
+        .initial_window = 8192,
+        .initial_ssthresh = 1024 * 1024,
+        .mss = 1460,
+        .min_window = 0,
+        .max_window = 16 * 1024 * 1024,
+    });
+
+    for (0..64) |_| {
+        cc.onLoss();
+    }
+    try std.testing.expect(cc.cwnd >= 1);
+
+    cc.in_slow_start = false;
+    cc.onAck(1460); // would divide by zero before the guard
+
+    for (0..64) |_| {
+        cc.onTimeout();
+    }
+    try std.testing.expect(cc.cwnd >= 1);
+
+    cc.in_slow_start = false;
+    cc.onAck(1460);
+    try std.testing.expect(cc.cwnd >= 1);
+}
+
+test "NakController backoff shift is clamped at 63" {
+    // A max_backoff >= 64 used to make currentDelay shift a u64 by >= 64
+    // bits, which panics. The exponent must clamp and the shift saturate.
+    var nak = NakController.init(.{
+        .base_delay_ns = 1,
+        .max_backoff = 128,
+        .max_retransmits = 1_000,
+    });
+
+    for (0..100) |i| {
+        nak.onNakSent(@intCast(i + 1));
+    }
+    try std.testing.expectEqual(@as(u32, 100), nak.backoff_multiplier);
+
+    // shift clamped to 63: 1 << 63.
+    try std.testing.expectEqual(@as(u64, 1) << 63, nak.currentDelay());
+
+    // Saturating variant: a big base delay caps at u64 max instead of
+    // shifting bits out.
+    nak.base_delay_ns = std.math.maxInt(u64) / 2;
+    try std.testing.expectEqual(std.math.maxInt(u64), nak.currentDelay());
+
+    // shouldSendNak must not overflow last_nak_time + delay.
+    nak.last_nak_time_ns = std.math.maxInt(u64) - 1;
+    nak.nak_count = 0;
+    _ = nak.shouldSendNak(std.math.maxInt(u64));
 }
 
 test "window never exceeds maximum" {

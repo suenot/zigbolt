@@ -7,8 +7,10 @@ const net = std.net;
 const builtin = @import("builtin");
 
 // ── Platform-specific constants ──────────────────────────────
-// IP_ADD_MEMBERSHIP is not exposed by Zig's std.posix for Unix targets.
+// These IP-level options are not exposed by Zig's std.posix for Unix targets.
 const IP_ADD_MEMBERSHIP: u32 = if (config.is_linux) 35 else 12; // Linux=35, macOS/BSD=12
+const IP_MULTICAST_TTL: u32 = if (config.is_linux) 33 else 10; // Linux=33, macOS/BSD=10
+const IP_MULTICAST_LOOP: u32 = if (config.is_linux) 34 else 11; // Linux=34, macOS/BSD=11
 
 /// ip_mreq structure for multicast group membership (POSIX).
 const IpMreq = extern struct {
@@ -23,6 +25,12 @@ pub const UdpConfig = struct {
     bind_address: net.Address,
     remote_address: ?net.Address = null, // default destination for unicast send
     multicast_group: ?[4]u8 = null, // IPv4 multicast group to join
+    /// Outgoing multicast TTL (hop limit). `null` keeps the OS default (1,
+    /// i.e. multicast does not leave the local subnet).
+    multicast_ttl: ?u8 = null,
+    /// Whether outgoing multicast is looped back to the local host.
+    /// `null` keeps the OS default (enabled).
+    multicast_loop: ?bool = null,
     send_buffer_size: u32 = 2 * 1024 * 1024, // 2 MB SO_SNDBUF
     recv_buffer_size: u32 = 2 * 1024 * 1024, // 2 MB SO_RCVBUF
     non_blocking: bool = true,
@@ -66,9 +74,12 @@ pub const UdpChannel = struct {
         // multiple processes.
         try setIntSockOpt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
 
-        // Socket buffer sizes.
-        try setIntSockOpt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, @as(i32, @intCast(udp_config.send_buffer_size)));
-        try setIntSockOpt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @as(i32, @intCast(udp_config.recv_buffer_size)));
+        // Socket buffer sizes. SO_SNDBUF/SO_RCVBUF take an int: clamp a
+        // configured size above 2 GB instead of panicking in @intCast
+        // (the kernel clamps to its own maximum anyway).
+        const max_buf: u32 = std.math.maxInt(i32);
+        try setIntSockOpt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, @as(i32, @intCast(@min(udp_config.send_buffer_size, max_buf))));
+        try setIntSockOpt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @as(i32, @intCast(@min(udp_config.recv_buffer_size, max_buf))));
 
         // Bind.
         try posix.bind(fd, &udp_config.bind_address.any, udp_config.bind_address.getOsSockLen());
@@ -85,6 +96,15 @@ pub const UdpChannel = struct {
                 IP_ADD_MEMBERSHIP,
                 std.mem.asBytes(&mreq),
             );
+        }
+
+        // Multicast TTL / loopback (config-driven; null preserves the OS
+        // defaults of TTL=1 and loop enabled).
+        if (udp_config.multicast_ttl) |ttl| {
+            try setIpByteOpt(fd, IP_MULTICAST_TTL, ttl);
+        }
+        if (udp_config.multicast_loop) |loop| {
+            try setIpByteOpt(fd, IP_MULTICAST_LOOP, if (loop) 1 else 0);
         }
 
         return .{
@@ -123,6 +143,9 @@ pub const UdpChannel = struct {
         var src_addr: posix.sockaddr align(4) = undefined;
         var addrlen: posix.socklen_t = @sizeOf(posix.sockaddr);
 
+        // Note: std.posix.recvfrom retries EINTR internally (`.INTR =>
+        // continue`), so a signal during recv cannot abort the poll loop
+        // and `error.Interrupted` is not part of its error set.
         const n = posix.recvfrom(
             self.socket_fd,
             buf,
@@ -177,7 +200,12 @@ pub const UdpChannel = struct {
         const header_size = frame.FrameHeader.SIZE;
         if (result.data.len < header_size) return error.InvalidFrame;
 
-        const hdr: *const frame.FrameHeader = @ptrCast(@alignCast(result.data.ptr));
+        // The caller's buffer has no alignment guarantee: copy the header
+        // into an aligned local before casting (an @alignCast on an
+        // unaligned `buf` would panic in Debug / be UB in release).
+        var hdr_buf: [@sizeOf(frame.FrameHeader)]u8 align(@alignOf(frame.FrameHeader)) = undefined;
+        @memcpy(&hdr_buf, result.data[0..@sizeOf(frame.FrameHeader)]);
+        const hdr: *const frame.FrameHeader = @ptrCast(&hdr_buf);
 
         if (!frame.isDataFrame(hdr.frame_length)) return error.InvalidFrame;
 
@@ -196,6 +224,16 @@ pub const UdpChannel = struct {
     /// Set an integer-valued socket option.
     fn setIntSockOpt(fd: posix.socket_t, level: i32, optname: u32, value: i32) !void {
         try posix.setsockopt(fd, level, optname, std.mem.asBytes(&value));
+    }
+
+    /// Set a byte-valued IPPROTO_IP option (multicast TTL/loop).
+    /// Linux reads these as int; macOS/BSD expect a single byte.
+    fn setIpByteOpt(fd: posix.socket_t, optname: u32, value: u8) !void {
+        if (config.is_linux) {
+            try setIntSockOpt(fd, posix.IPPROTO.IP, optname, @as(i32, value));
+        } else {
+            try posix.setsockopt(fd, posix.IPPROTO.IP, optname, std.mem.asBytes(&value));
+        }
     }
 };
 
@@ -266,6 +304,71 @@ test "UdpChannel framed send/recv" {
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings(payload, result.?.payload);
     try std.testing.expectEqual(msg_type, result.?.msg_type_id);
+}
+
+test "UdpChannel recvFrame works on an unaligned buffer" {
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    var ch = try UdpChannel.init(.{
+        .bind_address = bind_addr,
+        .non_blocking = true,
+    });
+    defer ch.deinit();
+
+    // Discover actual port.
+    var bound_addr: posix.sockaddr align(4) = undefined;
+    var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    const rc = std.c.getsockname(ch.socket_fd, &bound_addr, &bound_len);
+    if (rc != 0) return error.GetSockNameFailed;
+    const actual_addr = net.Address.initPosix(&bound_addr);
+
+    const payload = "unaligned recv";
+    try ch.sendFrame(payload, 7, actual_addr);
+
+    // Receive into a deliberately misaligned slice: the header lands on an
+    // odd address. The old @ptrCast(@alignCast(...)) panicked here.
+    var raw: [512]u8 align(8) = undefined;
+    const unaligned = raw[1..];
+
+    var result: ?UdpChannel.FrameRecvResult = null;
+    for (0..100) |_| {
+        result = try ch.recvFrame(unaligned);
+        if (result != null) break;
+        std.Thread.sleep(100_000); // 100 μs
+    }
+
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings(payload, result.?.payload);
+    try std.testing.expectEqual(@as(i32, 7), result.?.msg_type_id);
+}
+
+test "UdpChannel huge socket buffer sizes do not panic" {
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    // > 2 GB used to panic in the u32 -> i32 @intCast before reaching the
+    // kernel. The clamped value may still be rejected by the OS — an error
+    // is acceptable, a panic is not.
+    var ch = UdpChannel.init(.{
+        .bind_address = bind_addr,
+        .non_blocking = true,
+        .send_buffer_size = 3 * 1024 * 1024 * 1024,
+        .recv_buffer_size = 3 * 1024 * 1024 * 1024,
+    }) catch return;
+    ch.deinit();
+}
+
+test "UdpChannel multicast TTL and loop options" {
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    var ch = try UdpChannel.init(.{
+        .bind_address = bind_addr,
+        .non_blocking = true,
+        .multicast_ttl = 4,
+        .multicast_loop = true,
+    });
+    defer ch.deinit();
+
+    try std.testing.expect(ch.socket_fd >= 0);
 }
 
 test "UdpChannel non-blocking recv returns null when no data" {

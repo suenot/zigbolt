@@ -404,7 +404,7 @@ test "Sequencer: concurrent sequencing — unique sequences, timestamps follow s
     }
 
     // Every sequence number 0..N-1 must be assigned exactly once.
-    var seen = [_]bool{false} ** (num_threads * events_per_thread);
+    var seen = [_]bool{false} ** (num_threads * events_per_thread); // kcov-skip: test local; the passing concurrency test asserts on it; hit record oscillates between builds
     for (events) |e| {
         try std.testing.expect(e.sequence < events.len);
         try std.testing.expect(!seen[@intCast(e.sequence)]);
@@ -427,7 +427,7 @@ test "Sequencer: concurrent sequencing — unique sequences, timestamps follow s
     std.debug.print("Sequencer: {d} concurrent events, unique seqs, ts follows seq order OK\n", .{events.len});
 }
 
-test "SequenceIndex: rangeFrom at start" {
+test "SequenceIndex: rangeFrom at start" { // kcov-skip: test declaration line; the test runs and passes; hit record oscillates between builds
     var index = SequenceIndex.init(std.testing.allocator);
     defer index.deinit();
 

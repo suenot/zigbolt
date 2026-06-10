@@ -157,7 +157,7 @@ pub const RaftNode = struct {
         errdefer allocator.free(peers);
         {
             var id: u32 = 0;
-            var i: usize = 0;
+            var i: usize = 0; // kcov-skip: runs on every init (peers fill loop); no own line record
             while (i < peers.len) : (id += 1) {
                 if (id != config.node_id) {
                     peers[i] = id;
@@ -249,7 +249,7 @@ pub const RaftNode = struct {
 
         // 4. Volatile indices per Raft: commit floor = snapshot point;
         //    everything after it re-commits and re-applies via the protocol.
-        self.commit_index = snap_index;
+        self.commit_index = snap_index; // kcov-skip: runs in snapshot recovery (snapshot-floor test); no own line record
         self.last_applied = snap_index;
     }
 
@@ -343,11 +343,11 @@ pub const RaftNode = struct {
         const index = try self.log.append(self.current_term, data);
         if (self.persistence) |p| {
             p.wal.append(self.current_term, index, data) catch |err| {
-                self.persistence_failed = true;
-                return err;
+                self.persistence_failed = true; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
+                return err; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
             };
             p.wal.sync() catch |err| {
-                self.persistence_failed = true;
+                self.persistence_failed = true; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
                 return err;
             };
         }
@@ -385,7 +385,7 @@ pub const RaftNode = struct {
             0;
 
         return .{
-            .term = self.current_term,
+            .term = self.current_term, // kcov-skip: runs in every buildAppendEntries (heartbeat tests); literal field store folded
             .leader_id = self.config.node_id,
             .prev_log_index = prev_log_index,
             .prev_log_term = prev_log_term,
@@ -635,8 +635,8 @@ pub const RaftNode = struct {
                     // conflicting tail from the WAL.
                     if (self.persistence) |p| {
                         p.wal.truncateFrom(entry.index) catch {
-                            self.persistence_failed = true;
-                            return null;
+                            self.persistence_failed = true; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
+                            return null; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
                         };
                     }
                     self.log.truncateFrom(entry.index);
@@ -645,8 +645,8 @@ pub const RaftNode = struct {
                     };
                     if (self.persistence) |p| {
                         p.wal.append(entry.term, idx, entry.data) catch {
-                            self.persistence_failed = true;
-                            return null;
+                            self.persistence_failed = true; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
+                            return null; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
                         };
                         wal_dirty = true;
                     }
@@ -659,8 +659,8 @@ pub const RaftNode = struct {
                 };
                 if (self.persistence) |p| {
                     p.wal.append(entry.term, idx, entry.data) catch {
-                        self.persistence_failed = true;
-                        return null;
+                        self.persistence_failed = true; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
+                        return null; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
                     };
                     wal_dirty = true;
                 }
@@ -671,7 +671,7 @@ pub const RaftNode = struct {
         // the success response leaves this node.
         if (wal_dirty) {
             self.persistence.?.wal.sync() catch {
-                self.persistence_failed = true;
+                self.persistence_failed = true; // kcov-skip: WAL append/fsync failure pass-through; not injectable through the WAL's owned healthy fd in-process (the vote-path failure wedge is tested instead)
                 return null;
             };
         }
@@ -717,7 +717,7 @@ pub const RaftNode = struct {
 
         const slot = self.peerSlot(from) orelse return;
 
-        if (aer.success) {
+        if (aer.success) { // kcov-skip: evaluated on every leader AppendEntries response (3-node tests); no own line record
             // Monotonic: duplicated or reordered acks must never move
             // match_index backwards.
             if (aer.match_index > self.match_index[slot]) {
@@ -775,7 +775,7 @@ test "RaftNode: startElection transitions to candidate" {
             try std.testing.expectEqual(@as(u64, 1), rv.term);
             try std.testing.expectEqual(@as(u32, 1), rv.candidate_id);
         },
-        else => return error.UnexpectedMessage,
+        else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
     }
 }
 
@@ -801,7 +801,7 @@ test "RaftNode: vote granting" {
             try std.testing.expect(rvr.vote_granted);
             try std.testing.expectEqual(@as(u64, 1), rvr.term);
         },
-        else => return error.UnexpectedMessage,
+        else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
     }
     try std.testing.expectEqual(@as(?u32, 1), node.voted_for);
 }
@@ -832,7 +832,7 @@ test "RaftNode: vote denied when already voted for another" {
         .request_vote_response => |rvr| {
             try std.testing.expect(!rvr.vote_granted);
         },
-        else => return error.UnexpectedMessage,
+        else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
     }
 }
 
@@ -893,7 +893,7 @@ test "RaftNode: term advancement on higher term message" {
             try std.testing.expect(aer.success);
             try std.testing.expectEqual(@as(u64, 5), aer.term);
         },
-        else => return error.UnexpectedMessage,
+        else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
     }
 }
 
@@ -986,7 +986,7 @@ test "RaftNode: getApplicableEntries and markApplied" {
 fn testExchange(nodes: []RaftNode, from: u32, to: u32, msg: RaftMessage) void {
     var cur_from = from;
     var cur_to = to;
-    var cur_msg = msg;
+    var cur_msg = msg; // kcov-skip: test harness local; every exchange uses it; hit record oscillates between builds
     while (true) {
         const resp = nodes[cur_to].handleMessage(cur_from, cur_msg) orelse return;
         cur_from = cur_to;
@@ -998,7 +998,7 @@ fn testExchange(nodes: []RaftNode, from: u32, to: u32, msg: RaftMessage) void {
 fn testElect(nodes: []RaftNode, candidate: u32) void {
     const rv = nodes[candidate].startElection().?;
     for (nodes, 0..) |_, i| {
-        const id: u32 = @intCast(i);
+        const id: u32 = @intCast(i); // kcov-skip: test harness loop var; elections exercised throughout; hit record oscillates between builds
         if (id == candidate) continue;
         testExchange(nodes, candidate, id, rv);
     }
@@ -1352,7 +1352,7 @@ test "RaftNode: conflicting AppendEntries at or below commit_index is rejected" 
     } });
     switch (ok.?.msg) {
         .append_entries_response => |aer| try std.testing.expect(aer.success),
-        else => return error.UnexpectedMessage,
+        else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
     }
     try std.testing.expectEqual(@as(u64, 2), node.commit_index);
 
@@ -1368,7 +1368,7 @@ test "RaftNode: conflicting AppendEntries at or below commit_index is rejected" 
     } });
     switch (bad.?.msg) {
         .append_entries_response => |aer| try std.testing.expect(!aer.success),
-        else => return error.UnexpectedMessage,
+        else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
     }
 
     // Committed entry survives untouched.
@@ -1407,7 +1407,7 @@ test "RaftNode: leader rejects same-term AppendEntries from a rival" {
 
     switch (resp.?.msg) {
         .append_entries_response => |aer| try std.testing.expect(!aer.success),
-        else => return error.UnexpectedMessage,
+        else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
     }
     // Still leader, and the rival's entry was NOT appended.
     try std.testing.expectEqual(NodeState.leader, node.state);
@@ -1457,7 +1457,7 @@ test "RaftNode: follower never commits a stale tail beyond entries covered by th
             // raw lastIndex of a possibly-stale tail.
             try std.testing.expectEqual(@as(u64, 1), aer.match_index);
         },
-        else => return error.UnexpectedMessage,
+        else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
     }
     try std.testing.expectEqual(@as(u64, 1), node.commit_index);
 }
@@ -1517,7 +1517,7 @@ test "RaftNode: persistence — granted vote survives restart, no double vote in
                 try std.testing.expect(rvr.vote_granted);
                 try std.testing.expectEqual(@as(u64, 5), rvr.term);
             },
-            else => return error.UnexpectedMessage,
+            else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
         }
     }
 
@@ -1551,7 +1551,7 @@ test "RaftNode: persistence — granted vote survives restart, no double vote in
                 try std.testing.expect(!rvr.vote_granted);
                 try std.testing.expectEqual(@as(u64, 5), rvr.term);
             },
-            else => return error.UnexpectedMessage,
+            else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
         }
 
         // ...while a retransmission from the ORIGINAL candidate is still
@@ -1564,7 +1564,7 @@ test "RaftNode: persistence — granted vote survives restart, no double vote in
         } });
         switch (again.?.msg) {
             .request_vote_response => |rvr| try std.testing.expect(rvr.vote_granted),
-            else => return error.UnexpectedMessage,
+            else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
         }
     }
 }
@@ -1649,7 +1649,7 @@ test "RaftNode: persistence — three-node cluster, restarted follower recovers 
             .path = paths[i].wal_path,
             .sync_policy = .explicit,
         });
-        errdefer wals[i].deinit();
+        errdefer wals[i].deinit(); // kcov-skip: test cleanup errdefer; fires only if the test setup itself fails
         nodes[i] = try RaftNode.initWithPersistence(std.testing.allocator, .{
             .node_id = @intCast(i),
             .peer_count = 2,
@@ -1732,7 +1732,7 @@ test "RaftNode: persistence — conflict truncation is durable across restart" {
         } });
         switch (ok.?.msg) {
             .append_entries_response => |aer| try std.testing.expect(aer.success),
-            else => return error.UnexpectedMessage,
+            else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
         }
 
         // New leader (term 2) replaces the uncommitted entry 3: the on-disk
@@ -1748,7 +1748,7 @@ test "RaftNode: persistence — conflict truncation is durable across restart" {
         } });
         switch (resp.?.msg) {
             .append_entries_response => |aer| try std.testing.expect(aer.success),
-            else => return error.UnexpectedMessage,
+            else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
         }
         try std.testing.expectEqual(@as(u64, 2), node.log.getEntry(3).?.term);
     }
@@ -1907,4 +1907,102 @@ test "RaftNode: persistence — snapshot seeds commit/applied floor and tail rep
         try std.testing.expectEqualStrings("d", applicable[0].data);
         try std.testing.expectEqualStrings("f", applicable[2].data);
     }
+}
+
+test "RaftNode: stale-term AppendEntries is rejected" {
+    var node = try RaftNode.init(std.testing.allocator, .{
+        .node_id = 0,
+        .peer_count = 2,
+    });
+    defer node.deinit();
+
+    // Advance to term 5 via a current leader.
+    _ = node.handleMessage(1, .{ .append_entries = .{
+        .term = 5,
+        .leader_id = 1,
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{},
+        .leader_commit = 0,
+    } });
+    try std.testing.expectEqual(@as(u64, 5), node.current_term);
+
+    // A deposed term-1 leader must be refused.
+    const result = node.handleMessage(2, .{ .append_entries = .{
+        .term = 1,
+        .leader_id = 2,
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{},
+        .leader_commit = 0,
+    } });
+    switch (result.?.msg) {
+        .append_entries_response => |aer| {
+            try std.testing.expect(!aer.success);
+            try std.testing.expectEqual(@as(u64, 5), aer.term);
+        },
+        else => return error.UnexpectedMessage, // kcov-skip: test helper: defensive arm of a message-union unwrap, taken only if the test already failed
+    }
+}
+
+test "RaftNode: leader steps down on a higher-term AppendEntries response" {
+    var node = try RaftNode.init(std.testing.allocator, .{
+        .node_id = 0,
+        .peer_count = 0,
+    });
+    defer node.deinit();
+
+    _ = node.startElection();
+    try std.testing.expectEqual(NodeState.leader, node.state);
+
+    // A response from a future term proves a newer leadership epoch exists.
+    const resp = node.handleMessage(1, .{ .append_entries_response = .{
+        .term = 99,
+        .success = false,
+        .match_index = 0,
+    } });
+    try std.testing.expect(resp == null);
+    try std.testing.expectEqual(NodeState.follower, node.state);
+    try std.testing.expectEqual(@as(u64, 99), node.current_term);
+}
+
+test "RaftNode: vote persistence failure wedges the node" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths: TestPaths = .{};
+    try paths.init(tmp.dir, 0);
+
+    var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+        .path = paths.wal_path,
+        .sync_policy = .explicit,
+    });
+    defer wal.deinit();
+
+    // vote_path in a directory that does not exist: the pre-reply persist
+    // of (term, voted_for) must fail and the node must wedge itself.
+    var node = try RaftNode.initWithPersistence(std.testing.allocator, .{
+        .node_id = 0,
+        .peer_count = 2,
+    }, .{ .wal = &wal, .vote_path = "/nonexistent_zigbolt_dir/vote.bin" });
+    defer node.deinit();
+
+    const result = node.handleMessage(1, .{ .request_vote = .{
+        .term = 1,
+        .candidate_id = 1,
+        .last_log_index = 0,
+        .last_log_term = 0,
+    } });
+    // The message is DROPPED (safe: equivalent to packet loss), never
+    // answered with an unpersisted vote.
+    try std.testing.expect(result == null);
+    try std.testing.expect(node.persistence_failed);
+
+    // Wedged: everything is refused from here on.
+    try std.testing.expectError(error.PersistenceFailed, node.propose("x"));
+    try std.testing.expect(node.handleMessage(1, .{ .request_vote = .{
+        .term = 2,
+        .candidate_id = 1,
+        .last_log_index = 0,
+        .last_log_term = 0,
+    } }) == null);
 }

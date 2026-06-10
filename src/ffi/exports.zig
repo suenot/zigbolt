@@ -174,7 +174,7 @@ pub export fn zigbolt_poll(handle: ?*anyopaque, callback: ?FragmentHandlerFn, li
     };
 
     var cb_slot: FragmentHandlerFn = cb;
-    return w.obj().pollCtx(@ptrCast(&cb_slot), &Dispatch.dispatch, limit);
+    return w.obj().pollCtx(@ptrCast(&cb_slot), &Dispatch.dispatch, limit); // kcov-skip: runs in the passing ffi publish/poll roundtrip (S.count == 1 asserted); no own line record
 }
 
 // ── Version Info ─────────────────────────────────────────────
@@ -237,8 +237,8 @@ test "ffi publish/poll reject a transport handle (type confusion)" {
 
     const S = struct {
         var calls: u32 = 0;
-        fn cb(_: [*]const u8, _: u32, _: i32) callconv(.c) void {
-            calls += 1;
+        fn cb(_: [*]const u8, _: u32, _: i32) callconv(.c) void { // kcov-skip: intentionally never invoked: the test asserts a rejected handle does NOT reach the callback
+            calls += 1; // kcov-skip: intentionally never invoked: the test asserts a rejected handle does NOT reach the callback
         }
     };
     S.calls = 0;
@@ -280,8 +280,8 @@ test "ffi bogus and misaligned pointers are rejected without a crash" {
 
     const S = struct {
         var calls: u32 = 0;
-        fn cb(_: [*]const u8, _: u32, _: i32) callconv(.c) void {
-            calls += 1;
+        fn cb(_: [*]const u8, _: u32, _: i32) callconv(.c) void { // kcov-skip: intentionally never invoked: the test asserts a rejected handle does NOT reach the callback
+            calls += 1; // kcov-skip: intentionally never invoked: the test asserts a rejected handle does NOT reach the callback
         }
     };
     S.calls = 0;
@@ -377,4 +377,28 @@ test "ffi version exports match root.zig constants" {
     try testing.expectEqual(@as(u32, 0), zigbolt_version_major());
     try testing.expectEqual(@as(u32, 2), zigbolt_version_minor());
     try testing.expectEqual(@as(u32, 1), zigbolt_version_patch());
+}
+
+test "ffi ipc_open attaches to an existing channel" {
+    const creator = zigbolt_ipc_create("/zigbolt_test_ffi_open", 4096) orelse return error.TestUnexpectedResult;
+    defer zigbolt_ipc_destroy(creator);
+
+    const opener = zigbolt_ipc_open("/zigbolt_test_ffi_open", 4096) orelse return error.TestUnexpectedResult;
+    defer zigbolt_ipc_destroy(opener);
+
+    try testing.expectEqual(@as(i32, 0), zigbolt_publish(creator, "via open", "via open".len, 9));
+
+    const S = struct {
+        var count: u32 = 0;
+        var last_type: i32 = 0;
+        fn cb(_: [*]const u8, _: u32, t: i32) callconv(.c) void {
+            count += 1;
+            last_type = t;
+        }
+    };
+    S.count = 0;
+    S.last_type = 0;
+    try testing.expectEqual(@as(u32, 1), zigbolt_poll(opener, &S.cb, 10));
+    try testing.expectEqual(@as(u32, 1), S.count);
+    try testing.expectEqual(@as(i32, 9), S.last_type);
 }

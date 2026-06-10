@@ -180,3 +180,15 @@ test "RaftLog: truncateFrom with out-of-bounds index is no-op" {
     log.truncateFrom(5);
     try std.testing.expectEqual(@as(u64, 1), log.lastIndex());
 }
+
+test "RaftLog append survives allocation failure at every point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var log = RaftLog.init(allocator);
+            defer log.deinit();
+            _ = try log.append(1, "hello");
+            _ = try log.append(1, "world");
+            if (log.lastIndex() != 2) return error.TestUnexpectedResult;
+        }
+    }.run, .{});
+}

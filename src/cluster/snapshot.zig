@@ -210,7 +210,7 @@ pub const SnapshotManager = struct {
                     if (first_err == null) first_err = e;
                     continue;
                 },
-                else => return err,
+                else => return err, // kcov-skip: OS I/O failure pass-through; cannot be injected in-process
             };
             return snap;
         }
@@ -326,7 +326,7 @@ pub const SnapshotManager = struct {
 
         var header: [HEADER_SIZE]u8 = undefined;
         const header_read = file.readAll(&header) catch return false;
-        if (header_read < HEADER_SIZE) return false;
+        if (header_read < HEADER_SIZE) return false; // kcov-skip: defensive: file size was just checked >= header+crc; a short read needs concurrent truncation
 
         const magic = std.mem.bytesToValue(u32, header[0..4]);
         if (magic != SNAPSHOT_MAGIC) return false;
@@ -816,4 +816,59 @@ test "Snapshot: large state data (64KB)" {
     try testing.expectEqual(@as(u64, 999), snap.last_included_index);
     try testing.expectEqual(@as(usize, 65536), snap.data.len);
     try testing.expectEqualSlices(u8, big_data, snap.data);
+}
+
+test "SnapshotManager getLatestMeta and missing-directory handling" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    var dir_buf: [512]u8 = undefined;
+    const snap_dir = try std.fmt.bufPrint(&dir_buf, "{s}/snaps", .{base});
+    try std.fs.cwd().makePath(snap_dir);
+
+    var mgr = try SnapshotManager.init(std.testing.allocator, .{ .base_path = snap_dir });
+    defer mgr.deinit();
+    try std.testing.expect(mgr.getLatestMeta() == null);
+
+    // With the directory deleted, load returns null and cleanup is a no-op.
+    try std.fs.cwd().deleteTree(snap_dir);
+    try std.testing.expect((try mgr.loadLatestSnapshot()) == null);
+    try mgr.cleanOldSnapshots(2);
+
+    // Restore the directory: a snapshot publishes metadata.
+    try std.fs.cwd().makePath(snap_dir);
+    try mgr.takeSnapshot(4, 9, "meta-state");
+    const meta = mgr.getLatestMeta().?;
+    try std.testing.expectEqual(@as(u64, 4), meta.last_included_term);
+    try std.testing.expectEqual(@as(u64, 9), meta.last_included_index);
+}
+
+test "takeSnapshot removes the temp file when the rename fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    // Occupy the final snapshot name with a DIRECTORY.
+    try tmp.dir.makeDir("snapshot_7.zbsp");
+
+    var mgr = try SnapshotManager.init(std.testing.allocator, .{ .base_path = base });
+    defer mgr.deinit();
+    try std.testing.expect(std.meta.isError(mgr.takeSnapshot(1, 7, "doomed")));
+
+    // The errdefer removed the temp file.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("snapshot_7.zbsp.tmp", .{}));
+}
+
+test "validateSnapshotFile rejects files shorter than header+crc" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("snapshot_1.zbsp", .{});
+        defer f.close();
+        try f.writeAll(&[_]u8{ 1, 2, 3 });
+    }
+    try std.testing.expect(!SnapshotManager.validateSnapshotFile(tmp.dir, "snapshot_1.zbsp"));
 }

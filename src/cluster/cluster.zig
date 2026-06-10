@@ -42,9 +42,9 @@ pub const Cluster = struct {
     ) !Cluster {
         const raft_config = raft.RaftConfig{
             .node_id = config.node_id,
-            .peer_count = config.peer_count,
+            .peer_count = config.peer_count, // kcov-skip: runs on every init (cluster tests); literal field store folded, no own line record
             .election_timeout_min_ms = config.election_timeout_min_ms,
-            .election_timeout_max_ms = config.election_timeout_max_ms,
+            .election_timeout_max_ms = config.election_timeout_max_ms, // kcov-skip: runs on every init (cluster tests); literal field store folded, no own line record
             .heartbeat_interval_ms = config.heartbeat_interval_ms,
         };
         var node = try raft.RaftNode.initWithPersistence(allocator, raft_config, persistence);
@@ -430,4 +430,82 @@ test "Cluster: handleMessage delegates to raft node" {
 
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(u64, 3), cluster.node.current_term);
+}
+
+test "Cluster restores the state machine from a recovered snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.testing.allocator.dupe(u8, &@as([1]u8, undefined));
+    std.testing.allocator.free(base);
+    const real = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(real);
+    var wal_path_buf: [512]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&wal_path_buf, "{s}/wal.bin", .{real});
+    var vote_path_buf: [512]u8 = undefined;
+    const vote_path = try std.fmt.bufPrint(&vote_path_buf, "{s}/vote.bin", .{real});
+
+    // Boot 1 (raw RaftNode): apply one entry and snapshot the state machine.
+    {
+        var wal = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+            .path = wal_path,
+            .sync_policy = .explicit,
+        });
+        defer wal.deinit();
+        var snaps = try snapshot_mod.SnapshotManager.init(std.testing.allocator, .{
+            .base_path = real,
+        });
+        defer snaps.deinit();
+        var node = try raft.RaftNode.initWithPersistence(std.testing.allocator, .{
+            .node_id = 0,
+            .peer_count = 0,
+        }, .{ .wal = &wal, .vote_path = vote_path, .snapshots = &snaps });
+        defer node.deinit();
+
+        _ = node.startElection();
+        _ = try node.propose("a");
+        node.markApplied(1);
+        try node.takeSnapshot("cluster-snap-state");
+    }
+
+    // Boot 2 (Cluster): restore_fn must be seeded from the snapshot.
+    const S = struct {
+        var restored_buf: [64]u8 = undefined;
+        var restored_len: usize = 0;
+        var applied: u32 = 0;
+        fn apply(entry: []const u8) void {
+            _ = entry;
+            applied += 1;
+        }
+        fn restore(snapshot: []const u8) void {
+            const n = @min(snapshot.len, restored_buf.len);
+            @memcpy(restored_buf[0..n], snapshot[0..n]);
+            restored_len = snapshot.len;
+        }
+    };
+    S.restored_len = 0;
+    S.applied = 0;
+
+    var wal2 = try wal_mod.WriteAheadLog.init(std.testing.allocator, .{
+        .path = wal_path,
+        .sync_policy = .explicit,
+    });
+    defer wal2.deinit();
+    var snaps2 = try snapshot_mod.SnapshotManager.init(std.testing.allocator, .{
+        .base_path = real,
+    });
+    defer snaps2.deinit();
+
+    var cluster = try Cluster.initWithPersistence(std.testing.allocator, .{
+        .node_id = 0,
+        .peer_count = 0,
+    }, .{ .apply_fn = S.apply, .restore_fn = S.restore }, .{
+        .wal = &wal2,
+        .vote_path = vote_path,
+        .snapshots = &snaps2,
+    });
+    defer cluster.deinit();
+
+    try std.testing.expectEqualStrings("cluster-snap-state", S.restored_buf[0..S.restored_len]);
+    // The snapshotted prefix is NOT re-applied through apply_fn.
+    try std.testing.expectEqual(@as(u32, 0), S.applied);
 }

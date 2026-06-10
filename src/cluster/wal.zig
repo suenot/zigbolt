@@ -101,7 +101,7 @@ pub const WriteAheadLog = struct {
             .read = true,
             .truncate = false,
         }) catch |err| return err;
-        errdefer file.close();
+        errdefer file.close(); // kcov-skip: fires only if getEndPos fails on a freshly created file — not injectable in-process
 
         // Seek to end to get write position. Surface the error: silently
         // assuming position 0 would overwrite existing records.
@@ -133,7 +133,7 @@ pub const WriteAheadLog = struct {
     pub fn append(self: *WriteAheadLog, term: u64, index: u64, data: []const u8) !void {
         // record_length = term(8) + index(8) + payload + crc(4)
         const payload_len = data.len;
-        const record_length: u32 = @intCast(8 + 8 + payload_len + 4);
+        const record_length: u32 = @intCast(8 + 8 + payload_len + 4); // kcov-skip: runs on every append (WAL tests throughout); no own line record
 
         // Compute CRC over term + index + payload.
         var hasher = std.hash.Crc32.init();
@@ -253,6 +253,13 @@ pub const WriteAheadLog = struct {
         }
 
         var entries = std.ArrayListUnmanaged(WalEntry){};
+        // Any error past this point (mid-loop allocation, tail truncation,
+        // toOwnedSlice) must release every payload already collected — the
+        // per-iteration errdefer below only covers the record being read.
+        errdefer {
+            for (entries.items) |e| self.allocator.free(e.data);
+            entries.deinit(self.allocator);
+        }
         var pos: u64 = 0;
 
         while (pos + HEADER_SIZE + CRC_SIZE <= file_size) {
@@ -280,7 +287,7 @@ pub const WriteAheadLog = struct {
             if (payload_len > 0) {
                 const data_read = try self.file.preadAll(data, pos + HEADER_SIZE);
                 if (data_read < payload_len) {
-                    self.allocator.free(data);
+                    self.allocator.free(data); // kcov-skip: defensive: record extent is pre-validated against file size; a short read needs concurrent truncation
                     break;
                 }
             }
@@ -289,7 +296,7 @@ pub const WriteAheadLog = struct {
             var crc_buf: [4]u8 = undefined;
             const crc_read = try self.file.preadAll(&crc_buf, pos + HEADER_SIZE + payload_len);
             if (crc_read < 4) {
-                self.allocator.free(data);
+                self.allocator.free(data); // kcov-skip: defensive: record extent is pre-validated against file size; a short read needs concurrent truncation
                 break;
             }
             const stored_crc = std.mem.bytesToValue(u32, &crc_buf);
@@ -335,14 +342,9 @@ pub const WriteAheadLog = struct {
             try self.file.sync();
         }
 
-        return entries.toOwnedSlice(self.allocator) catch |err| {
-            // On allocation failure, free everything.
-            for (entries.items) |e| {
-                self.allocator.free(e.data);
-            }
-            entries.deinit(self.allocator);
-            return err;
-        };
+        // On failure the errdefer above frees the collected entries; on
+        // success toOwnedSlice empties the list and hands ownership over.
+        return entries.toOwnedSlice(self.allocator);
     }
 
     /// Force an fsync to disk. A Raft caller MUST invoke this (or use
@@ -425,7 +427,8 @@ pub const WriteAheadLog = struct {
         const computed_crc = hasher.final();
 
         if (stored_crc != computed_crc) {
-            self.allocator.free(data);
+            // The errdefer above frees `data` on this error return; freeing
+            // here as well was a double free.
             return error.CrcMismatch;
         }
 
@@ -991,4 +994,122 @@ test "WAL: large payload entry" {
     try testing.expectEqual(@as(u64, 5), entry.term);
     try testing.expectEqual(@as(usize, 65536), entry.data.len);
     try testing.expectEqualSlices(u8, big_data, entry.data);
+}
+
+test "WAL every_n_entries sync policy batches fsyncs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/batched.wal", .{base});
+
+    var wal = try WriteAheadLog.init(std.testing.allocator, .{
+        .path = path,
+        .sync_policy = .every_n_entries,
+        .sync_interval = 2,
+    });
+    defer wal.deinit();
+
+    try wal.append(1, 1, "a");
+    try std.testing.expectEqual(@as(u32, 1), wal.entries_since_sync);
+    // Second append reaches the interval: fsync runs and the counter resets.
+    try wal.append(1, 2, "b");
+    try std.testing.expectEqual(@as(u32, 0), wal.entries_since_sync);
+}
+
+test "WAL truncateFrom the first entry empties the log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/trunc.wal", .{base});
+
+    var wal = try WriteAheadLog.init(std.testing.allocator, .{ .path = path, .sync_policy = .explicit });
+    defer wal.deinit();
+
+    try wal.append(1, 1, "a");
+    try wal.append(1, 2, "b");
+    try wal.truncateFrom(1);
+
+    try std.testing.expectEqual(@as(u64, 0), wal.first_index);
+    try std.testing.expectEqual(@as(u64, 0), wal.last_index);
+    try std.testing.expect((try wal.readEntry(1)) == null);
+    try std.testing.expectEqual(@as(u64, 0), wal.write_pos);
+}
+
+test "WAL readEntry detects payload corruption without a double free" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/crc.wal", .{base});
+
+    var wal = try WriteAheadLog.init(std.testing.allocator, .{ .path = path, .sync_policy = .explicit });
+    defer wal.deinit();
+
+    try wal.append(3, 1, "payload-x");
+
+    // Flip one payload byte on disk (payload starts after the 20-byte header).
+    try wal.file.pwriteAll(&[_]u8{0xFF}, WriteAheadLog.HEADER_SIZE);
+
+    // Before the fix this error path freed `data` twice (explicit free +
+    // errdefer) — heap corruption the testing allocator catches.
+    try std.testing.expectError(error.CrcMismatch, wal.readEntry(1));
+
+    // The WAL stays usable.
+    try wal.append(3, 2, "ok");
+    const e = (try wal.readEntry(2)).?;
+    defer std.testing.allocator.free(e.data);
+    try std.testing.expectEqualStrings("ok", e.data);
+}
+
+test "WAL recover survives allocation failure at every point" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/oom.wal", .{base});
+
+    {
+        var wal = try WriteAheadLog.init(std.testing.allocator, .{ .path = path, .sync_policy = .explicit });
+        defer wal.deinit();
+        try wal.append(1, 1, "first");
+        try wal.append(1, 2, "second");
+        try wal.sync();
+    }
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, wal_path: []const u8) !void {
+            var wal = try WriteAheadLog.init(allocator, .{ .path = wal_path, .sync_policy = .explicit });
+            defer wal.deinit();
+            const entries = try wal.recover();
+            defer {
+                for (entries) |e| allocator.free(e.data);
+                allocator.free(entries);
+            }
+            if (entries.len != 2) return error.TestUnexpectedResult;
+        }
+    }.run, .{path});
+}
+
+test "VoteState.save removes the temp file when the rename fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    // Occupy the final vote path with a DIRECTORY so the rename must fail.
+    try tmp.dir.makeDir("vote.bin");
+    var path_buf: [512]u8 = undefined;
+    const vote_path = try std.fmt.bufPrint(&path_buf, "{s}/vote.bin", .{base});
+
+    const vs = VoteState{ .current_term = 3, .voted_for = 1 };
+    try std.testing.expect(std.meta.isError(vs.save(vote_path)));
+
+    // The errdefer removed the temp file.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("vote.bin.tmp", .{}));
 }

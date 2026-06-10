@@ -49,6 +49,16 @@ pub fn build(b: *std.Build) void {
     const run_t = b.addRunArtifact(t);
     test_step.dependOn(&run_t.step);
 
+    // The C-ABI surface (src/ffi/exports.zig) is the root file of ffi_mod
+    // and a file may belong to only one module per compilation, so it
+    // cannot be pulled into the root test module via @import. Type-check
+    // and run its tests as a dedicated test artifact instead.
+    const ffi_tests = b.addTest(.{
+        .root_module = ffi_mod,
+    });
+    const run_ffi_tests = b.addRunArtifact(ffi_tests);
+    test_step.dependOn(&run_ffi_tests.step);
+
     // ── Benchmarks ───────────────────────────────────────────
     const bench_step = b.step("bench", "Run benchmarks");
 

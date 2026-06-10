@@ -169,6 +169,10 @@ pub const version_minor: u32 = 2;
 pub const version_patch: u32 = 1;
 
 // ── Tests ────────────────────────────────────────────────────
+// Note: src/ffi/exports.zig cannot be referenced here — it is the root file
+// of the FFI library module, and a file may belong to only one module per
+// compilation. Its tests run via the dedicated FFI test artifact wired into
+// `zig build test` in build.zig.
 test {
     @import("std").testing.refAllDeclsRecursive(@This());
 }

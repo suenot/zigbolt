@@ -60,20 +60,46 @@ pub fn LogBuffer(comptime cfg: LogBufferConfig) type {
 
         // ── Publisher API ─────────────────────────────────────────────
 
+        /// Maximum distance the writer may run ahead of the reader. Keeping
+        /// the writer within (term_count - 1) terms guarantees that a term
+        /// being re-entered after rotation has been fully consumed, so it can
+        /// be cleaned without yanking data out from under the reader.
+        const publication_window: u64 = @as(u64, term_count - 1) * term_length;
+
         /// Claim space for a message of `length` payload bytes.
         /// Returns `null` when the claim cannot be satisfied (consumer is too far behind).
         pub fn claim(self: *Self, length: u32) ?Claim {
             if (length == 0 or length > frame.MAX_PAYLOAD_SIZE) return null;
 
             const required = frame.alignedFrameLength(length);
+            if (required > term_length) return null; // can never fit in a term
 
             while (true) {
                 const tail = self.tail_position.load(.monotonic);
+                const head = self.head_position.load(.acquire);
                 const t_offset = termOffset(tail);
                 const t_idx = termIndex(tail);
 
                 // Does the message fit in the current term?
                 if (t_offset + required <= term_length) {
+                    // Back-pressure: refuse the claim while it would put the
+                    // writer more than (term_count - 1) terms ahead of the
+                    // reader — otherwise the writer laps the reader and
+                    // overwrites frames that were never consumed.
+                    if (tail + required - head > publication_window) return null;
+
+                    // First claim in a fresh term after a full rotation:
+                    // clean the term so stale committed headers from the
+                    // previous lap cannot be misread as live frames. The
+                    // publication window above guarantees the reader has
+                    // fully drained this region.
+                    // NOTE: zero-before-CAS is only safe with a single
+                    // publisher (the current usage); a true MPSC publisher
+                    // would have to clean under the winning rotation CAS.
+                    if (t_offset == 0 and tail != 0) {
+                        @memset(&self.terms[t_idx], 0);
+                    }
+
                     // Try to advance the tail atomically (CAS for future MPSC).
                     const new_tail = tail + required;
                     if (self.tail_position.cmpxchgWeak(
@@ -97,6 +123,11 @@ pub fn LogBuffer(comptime cfg: LogBufferConfig) type {
                 // Message does not fit — insert a padding frame covering the rest
                 // of the current term and rotate to the next one.
                 const remaining: u32 = @intCast(term_length - t_offset);
+
+                // Apply the publication window to padding + message so the
+                // tail never advances into a term the reader still occupies.
+                if (tail + remaining + required - head > publication_window) return null;
+
                 const new_tail = tail + remaining; // start of next term
 
                 if (self.tail_position.cmpxchgWeak(
@@ -279,6 +310,98 @@ test "term rotation" {
     resetCollected();
     const n = buf.read(&collectHandler, 64);
     try testing.expectEqual(@as(u32, frames_per_term + 1), n);
+}
+
+// ── Test: back-pressure with a stalled reader ─────────────────────────
+
+test "claim applies back-pressure instead of lapping the reader" {
+    var buf = TestBuf.init(); // term_length = 256, window = 2 * 256 = 512
+
+    const payload = "12345678"; // 16-byte aligned frames
+    // With a stalled reader, the writer may fill at most 2 of the 3 terms.
+    var claims: u32 = 0;
+    while (claims < 100) {
+        const c = buf.claim(@intCast(payload.len)) orelse break;
+        writePayload(c, payload);
+        buf.commit(c, @intCast(claims));
+        claims += 1;
+    }
+    try testing.expectEqual(@as(u32, 32), claims); // 2 * 256 / 16
+
+    // Still blocked until the reader makes progress.
+    try testing.expect(buf.claim(@intCast(payload.len)) == null);
+
+    // Drain one term worth of frames; claims must succeed again and the
+    // already-published frames must be intact (nothing was overwritten).
+    resetCollected();
+    const n = buf.read(&collectHandler, 16);
+    try testing.expectEqual(@as(u32, 16), n);
+    for (0..16) |i| {
+        try testing.expectEqualSlices(u8, payload, collected_msgs[i]);
+        try testing.expectEqual(@as(i32, @intCast(i)), collected_types[i]);
+    }
+    try testing.expect(buf.claim(@intCast(payload.len)) != null);
+}
+
+// ── Test: content integrity across full rotations ─────────────────────
+
+test "content round-trips across full term rotation" {
+    var buf = TestBuf.init();
+
+    // Drive well past term_count * term_length (768) cumulative bytes:
+    // 100 * 16 = 1600 bytes, i.e. more than two full rotations.
+    var round: u32 = 0;
+    while (round < 100) : (round += 1) {
+        var payload: [8]u8 = undefined;
+        for (&payload, 0..) |*b, i| {
+            b.* = @truncate(round * 13 + @as(u32, @intCast(i)));
+        }
+        const c = buf.claim(8) orelse return error.ClaimFailed;
+        writePayload(c, &payload);
+        buf.commit(c, @intCast(round));
+
+        resetCollected();
+        const n = buf.read(&collectHandler, 4);
+        try testing.expectEqual(@as(u32, 1), n);
+        try testing.expectEqualSlices(u8, &payload, collected_msgs[0]);
+        try testing.expectEqual(@as(i32, @intCast(round)), collected_types[0]);
+    }
+}
+
+// ── Test: rotated terms are cleaned before reuse ──────────────────────
+
+test "rotated term is cleaned: stale headers are not misread as committed" {
+    var buf = TestBuf.init();
+
+    const payload = "12345678"; // 16-byte frames, 16 per term
+    // One full lap over all three terms, reader keeping pace.
+    var i: u32 = 0;
+    while (i < 48) : (i += 1) {
+        const c = buf.claim(@intCast(payload.len)) orelse return error.ClaimFailed;
+        writePayload(c, payload);
+        buf.commit(c, 7);
+        resetCollected();
+        try testing.expectEqual(@as(u32, 1), buf.read(&collectHandler, 1));
+    }
+
+    // tail == head == 768; the writer now re-enters term 0, which held
+    // committed frame headers from the first lap.
+    const c = buf.claim(8) orelse return error.ClaimFailed;
+    try testing.expectEqual(@as(u32, 0), c.term_id);
+    try testing.expectEqual(@as(u32, 0), c.term_offset);
+
+    // The claim is NOT committed yet: the reader must see an uncommitted
+    // (zeroed) region, not the stale frame_length from the previous lap.
+    resetCollected();
+    try testing.expectEqual(@as(u32, 0), buf.read(&collectHandler, 4));
+
+    // After committing, exactly the fresh frame is delivered.
+    writePayload(c, "abcdefgh");
+    buf.commit(c, 99);
+    resetCollected();
+    try testing.expectEqual(@as(u32, 1), buf.read(&collectHandler, 4));
+    try testing.expectEqualSlices(u8, "abcdefgh", collected_msgs[0]);
+    try testing.expectEqual(@as(i32, 99), collected_types[0]);
 }
 
 // ── Test: padding frame on term boundary ──────────────────────────────

@@ -249,27 +249,54 @@ pub const BroadcastReceiver = struct {
 
             // Check if we were lapped (transmitter overwrote our position).
             if (tail > self.cursor + @as(i64, self.capacity)) {
-                // Skip forward to the earliest available data.
-                self.lapped_count += 1;
-                self.cursor = tail - @as(i64, self.capacity);
-                self.next_record = self.cursor;
+                if (!self.resyncToLatest()) return null;
             }
 
-            const record_offset: u32 = @intCast(@as(u64, @bitCast(self.next_record)) & self.mask);
+            const record_start = self.next_record;
+            const record_offset: u32 = @intCast(@as(u64, @bitCast(record_start)) & self.mask);
             const header: *const RecordHeader = @ptrCast(@alignCast(&self.buffer[record_offset]));
 
+            // The header may belong to a record the transmitter is currently
+            // overwriting; sanity-check the length BEFORE using it so a
+            // garbage value cannot panic (negative @intCast / OOB slice)
+            // ahead of the validate() check.
+            const raw_len = header.payload_length;
+
             if (header.msg_type_id == PADDING_MSG_TYPE_ID) {
-                // Padding record — payload_length holds the total padding size.
-                const padding_size: u32 = @intCast(header.payload_length);
-                self.next_record += @as(i64, padding_size);
+                // Padding record — payload_length holds the total padding
+                // size, which always fills exactly to the end of the buffer.
+                if (raw_len <= 0 or @as(u32, @intCast(raw_len)) > self.capacity - record_offset) {
+                    // Garbage header — we must have been lapped mid-read.
+                    if (!self.resyncToLatest()) return null;
+                    more = true;
+                    continue;
+                }
+                if (!self.validateAt(record_start)) {
+                    if (!self.resyncToLatest()) return null;
+                    more = true;
+                    continue;
+                }
+                self.next_record += @as(i64, @as(u32, @intCast(raw_len)));
                 self.cursor = self.next_record;
                 more = true;
                 continue;
             }
 
-            // payload_length is the actual payload size.
-            const payload_len: u32 = @intCast(header.payload_length);
+            // Data record — payload_length is the actual payload size.
+            if (raw_len <= 0 or @as(u32, @intCast(raw_len)) > self.calculateMaxMessageLength()) {
+                // Garbage header — we must have been lapped mid-read.
+                if (!self.resyncToLatest()) return null;
+                more = true;
+                continue;
+            }
+            const payload_len: u32 = @intCast(raw_len);
             const aligned_len: u32 = alignedRecordLength(payload_len);
+            if (record_offset + aligned_len > self.capacity) {
+                // A genuine record never crosses the end of the buffer.
+                if (!self.resyncToLatest()) return null;
+                more = true;
+                continue;
+            }
 
             // Extract payload.
             const payload_offset = record_offset + HEADER_LENGTH;
@@ -280,13 +307,12 @@ pub const BroadcastReceiver = struct {
             self.next_record += @as(i64, aligned_len);
             self.cursor = self.next_record;
 
-            // Validate the record is still intact (not overwritten while we read it).
-            if (!self.validate()) {
+            // Validate against the START of the record we just read — not
+            // the advanced cursor, which would tolerate the transmitter
+            // overwriting exactly the record being returned.
+            if (!self.validateAt(record_start)) {
                 // Data was overwritten while we were reading. Skip forward.
-                self.lapped_count += 1;
-                const new_tail = self.tail_counter.load(.acquire);
-                self.cursor = new_tail - @as(i64, self.capacity);
-                self.next_record = self.cursor;
+                if (!self.resyncToLatest()) return null;
                 more = true;
                 continue;
             }
@@ -299,13 +325,38 @@ pub const BroadcastReceiver = struct {
         return null;
     }
 
+    /// Resync to the start of the most recent record published by the
+    /// transmitter (`latest_counter` always holds a real record start —
+    /// unlike `tail - capacity`, which can land on an arbitrary mid-record
+    /// byte). Increments lapped_count and returns true on success; returns
+    /// false when there is no newer record to jump to (prevents spinning).
+    fn resyncToLatest(self: *BroadcastReceiver) bool {
+        const latest = self.latest_counter.load(.acquire);
+        if (self.next_record == latest) return false;
+        self.lapped_count += 1;
+        self.cursor = latest;
+        self.next_record = latest;
+        return true;
+    }
+
+    /// Validate that the record starting at `record_position` has not been
+    /// overwritten by the transmitter.
+    fn validateAt(self: *const BroadcastReceiver, record_position: i64) bool {
+        const tail_intent = self.tail_intent_counter.load(.acquire);
+        // If tail_intent has moved more than capacity past the record start,
+        // the transmitter has (or is about to have) overwritten the record.
+        return tail_intent <= (record_position + @as(i64, self.capacity));
+    }
+
     /// Validate that the data at the current cursor position is still valid
     /// (not overwritten by the transmitter).
     pub fn validate(self: *const BroadcastReceiver) bool {
-        const tail_intent = self.tail_intent_counter.load(.acquire);
-        // If tail_intent has moved more than capacity past our cursor,
-        // the transmitter has overwritten our data.
-        return tail_intent <= (self.cursor + @as(i64, self.capacity));
+        return self.validateAt(self.cursor);
+    }
+
+    /// Maximum payload size for a single message (mirrors the transmitter).
+    pub fn calculateMaxMessageLength(self: *const BroadcastReceiver) u32 {
+        return (self.capacity / 8) - HEADER_LENGTH;
     }
 
     /// How many times this receiver was lapped (messages lost).
@@ -333,9 +384,31 @@ pub const CopyBroadcastReceiver = struct {
 
     /// Receive next message, copying payload to internal scratch buffer.
     /// Returns a stable slice that won't be overwritten by the transmitter.
+    /// Returns null when no message is available, when the message is larger
+    /// than the scratch buffer (it is dropped), or when the record was
+    /// overwritten by the transmitter while it was being copied (discarded).
     pub fn receiveNext(self: *CopyBroadcastReceiver) ?BroadcastReceiver.Message {
         const msg = self.receiver.receiveNext() orelse return null;
+
+        // Guard the scratch buffer: with capacity > 32 KB the max message
+        // length exceeds the scratch size; drop oversized messages instead
+        // of overflowing the copy.
+        if (msg.payload.len > self.scratch.len) {
+            return null;
+        }
+
         @memcpy(self.scratch[0..msg.payload.len], msg.payload);
+
+        // Aeron requirement: re-validate AFTER the copy. The transmitter may
+        // have overwritten the record while we were copying from the live
+        // buffer; if so the scratch contents are torn and must be discarded.
+        const record_start = self.receiver.cursor -
+            @as(i64, alignedRecordLength(@intCast(msg.payload.len)));
+        if (!self.receiver.validateAt(record_start)) {
+            self.receiver.lapped_count += 1;
+            return null;
+        }
+
         return .{
             .msg_type_id = msg.msg_type_id,
             .payload = self.scratch[0..msg.payload.len],
@@ -461,11 +534,63 @@ test "padding at buffer wrap-around" {
         try testing.expectEqualStrings(payload, msg.payload);
     }
     // The buffer is 256 bytes. 11 records + padding = 280 bytes, which exceeds
-    // capacity, so the receiver gets lapped for the first record and reads 10.
+    // capacity, so the receiver gets lapped and resyncs to the most recent
+    // record via latest_counter (Aeron semantics: lossy jump-to-latest).
     // The important thing is that padding is handled transparently and the
     // wrapped record (type 2) is received correctly.
-    try testing.expect(count >= 10);
+    try testing.expect(count >= 1);
     try testing.expect(saw_type2);
+    try testing.expect(rx.lappedCount() >= 1);
+}
+
+test "lapped receiver resyncs to a real record via latest_counter" {
+    const cap = 256;
+    var buf: [totalBufferSize(cap)]u8 align(config.cache_line_size) = [_]u8{0} ** totalBufferSize(cap);
+    var tx = BroadcastTransmitter.init(&buf);
+    var rx = BroadcastReceiver.init(&buf); // joins at position 0
+
+    // Variable-size records so that (tail - capacity) — the old, broken
+    // resync point — falls mid-record rather than on a record boundary.
+    // Payload bytes are ASCII letters: parsed as a header they would yield
+    // a huge bogus payload_length.
+    const sizes = [_]usize{ 5, 13, 21 };
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        var payload: [24]u8 = undefined;
+        @memset(&payload, 'A' + @as(u8, @intCast(i % 26)));
+        tx.transmit(1, payload[0..sizes[i % sizes.len]]);
+    }
+    tx.transmit(7, "LAST-MSG");
+
+    // The receiver is far behind; it must resync to the latest record start
+    // (a real boundary) and deliver intact data, not misframe garbage.
+    const msg = rx.receiveNext() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i32, 7), msg.msg_type_id);
+    try testing.expectEqualStrings("LAST-MSG", msg.payload);
+    try testing.expectEqual(@as(u64, 1), rx.lappedCount());
+
+    // Nothing newer after the latest record.
+    try testing.expect(rx.receiveNext() == null);
+}
+
+test "CopyBroadcastReceiver rejects messages larger than its scratch buffer" {
+    // 64 KB capacity → max message = 8184 bytes > the 4096-byte scratch.
+    const cap = 64 * 1024;
+    var buf: [totalBufferSize(cap)]u8 align(config.cache_line_size) = [_]u8{0} ** totalBufferSize(cap);
+    var tx = BroadcastTransmitter.init(&buf);
+    var crx = CopyBroadcastReceiver.init(&buf);
+
+    const big: [5000]u8 = @splat(0x55);
+    tx.transmit(9, &big);
+
+    // Oversized message is dropped instead of overflowing the scratch copy.
+    try testing.expect(crx.receiveNext() == null);
+
+    // Subsequent messages flow normally.
+    tx.transmit(10, "fits-fine");
+    const msg = crx.receiveNext() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i32, 10), msg.msg_type_id);
+    try testing.expectEqualStrings("fits-fine", msg.payload);
 }
 
 test "multiple receivers reading independently" {

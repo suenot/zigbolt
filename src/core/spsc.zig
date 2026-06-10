@@ -38,7 +38,9 @@ pub fn SpscRingBuffer(comptime capacity: usize) type {
 
         buffer: [capacity]u8 align(config.cache_line_size) = [_]u8{0} ** capacity,
 
-        // Scratch buffer used when a read payload wraps around the ring boundary.
+        // Scratch buffer that every read payload is copied into before the
+        // tail is released. The returned slice stays valid until the next
+        // `read()` call, even if the producer immediately reuses the region.
         _scratch: [capacity]u8 = undefined,
 
         /// Create an initialized ring buffer with the buffer zeroed.
@@ -51,6 +53,10 @@ pub fn SpscRingBuffer(comptime capacity: usize) type {
         /// Write a framed message into the ring buffer.
         /// Returns `false` if there is not enough space (buffer full).
         pub fn write(self: *Self, data: []const u8, msg_type_id: i32) bool {
+            // Reject payloads whose frame arithmetic would overflow u32
+            // (a data.len near 4 GB would wrap @intCast/alignedFrameLength).
+            if (data.len > frame.MAX_PAYLOAD_SIZE) return false;
+
             const payload_len: u32 = @intCast(data.len);
             const total_len: usize = frame.alignedFrameLength(payload_len);
 
@@ -99,6 +105,9 @@ pub fn SpscRingBuffer(comptime capacity: usize) type {
 
         /// Read the next framed message from the ring buffer.
         /// Returns `null` if the buffer is empty.
+        ///
+        /// The returned slice points into a receiver-owned scratch buffer and
+        /// remains valid until the NEXT call to `read()`.
         pub fn read(self: *Self) ?ReadResult {
             const tail_pos = self.tail.load(.acquire);
             const head_pos = self.head.load(.acquire);
@@ -119,22 +128,18 @@ pub fn SpscRingBuffer(comptime capacity: usize) type {
             const payload_len: u32 = @intCast(header.frame_length);
             const total_len: usize = frame.alignedFrameLength(payload_len);
 
-            // Return a slice view into the ring buffer for the payload.
-            // Because the buffer wraps, we need to check whether the payload
-            // is contiguous. For the common case we return a direct slice;
-            // when wrapping occurs we copy into _scratch byte-by-byte.
+            // Copy the payload into `_scratch` BEFORE the tail is released.
+            // The release store below hands the region back to the producer,
+            // which may overwrite it immediately — returning a slice into
+            // `buffer` here would be a use-after-release data race. The copy
+            // costs a little throughput, but for a standalone primitive the
+            // zero-copy micro-optimisation is not worth handing out bytes the
+            // producer can concurrently scribble over.
             const payload_start = (tail_pos + @sizeOf(frame.FrameHeader)) & mask;
-            const payload_end = payload_start + payload_len;
 
-            if (payload_end <= capacity) {
-                // Contiguous — return direct slice.
-                const result = ReadResult{
-                    .data = self.buffer[payload_start .. payload_start + payload_len],
-                    .msg_type_id = header.msg_type_id,
-                };
-                // Advance the tail past the entire aligned frame.
-                self.tail.store(tail_pos + total_len, .release);
-                return result;
+            if (payload_start + payload_len <= capacity) {
+                // Contiguous payload — single memcpy into scratch.
+                @memcpy(self._scratch[0..payload_len], self.buffer[payload_start..][0..payload_len]);
             } else {
                 // Wrapped — copy the full payload through the mask into _scratch.
                 var read_pos = tail_pos + @sizeOf(frame.FrameHeader);
@@ -142,14 +147,17 @@ pub fn SpscRingBuffer(comptime capacity: usize) type {
                     self._scratch[i] = self.buffer[read_pos & mask];
                     read_pos += 1;
                 }
-                const result = ReadResult{
-                    .data = self._scratch[0..payload_len],
-                    .msg_type_id = header.msg_type_id,
-                };
-                // Advance the tail past the entire aligned frame.
-                self.tail.store(tail_pos + total_len, .release);
-                return result;
             }
+
+            // Advance the tail past the entire aligned frame. After this
+            // store the producer may reuse the region; the returned slice
+            // points into `_scratch` and is unaffected.
+            self.tail.store(tail_pos + total_len, .release);
+
+            return ReadResult{
+                .data = self._scratch[0..payload_len],
+                .msg_type_id = header.msg_type_id,
+            };
         }
     };
 }
@@ -210,6 +218,64 @@ test "fill and drain" {
 
     // Buffer should be empty now.
     try std.testing.expect(rb.read() == null);
+}
+
+test "read result survives producer reusing the region (no use-after-release)" {
+    // Capacity 32: one 24-byte-payload frame fills the whole ring, so the
+    // next write reuses exactly the bytes of the frame we just read.
+    var rb = SpscRingBuffer(32).init();
+
+    var msg_a: [24]u8 = undefined;
+    for (&msg_a, 0..) |*b, i| b.* = @intCast(i + 1);
+    var msg_b: [24]u8 = undefined;
+    for (&msg_b, 0..) |*b, i| b.* = @intCast(0xC0 - i);
+
+    try std.testing.expect(rb.write(&msg_a, 1));
+    const r = rb.read() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i32, 1), r.msg_type_id);
+
+    // Producer reuses the freed region with a same-size message.
+    try std.testing.expect(rb.write(&msg_b, 2));
+
+    // The slice returned by the earlier read must still hold msg A even
+    // though the producer overwrote the ring region it came from.
+    try std.testing.expectEqualSlices(u8, &msg_a, r.data);
+
+    const r2 = rb.read() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &msg_b, r2.data);
+    try std.testing.expectEqual(@as(i32, 2), r2.msg_type_id);
+}
+
+test "mixed-size messages round-trip across the wrap boundary" {
+    var rb = SpscRingBuffer(128).init();
+
+    const sizes = [_]usize{ 1, 7, 24, 40, 3, 16, 33, 8 };
+    for (0..50) |round| {
+        const size = sizes[round % sizes.len];
+        var payload: [64]u8 = undefined;
+        for (payload[0..size], 0..) |*b, i| {
+            b.* = @truncate(round * 31 + i);
+        }
+        try std.testing.expect(rb.write(payload[0..size], @intCast(round)));
+
+        const r = rb.read() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualSlices(u8, payload[0..size], r.data);
+        try std.testing.expectEqual(@as(i32, @intCast(round)), r.msg_type_id);
+    }
+}
+
+test "oversized message is rejected" {
+    var rb = SpscRingBuffer(64).init();
+    // Build a slice with a huge length but no real backing memory — write()
+    // must reject it via the MAX_PAYLOAD_SIZE guard before touching any byte
+    // (previously the u32 @intCast / alignedFrameLength would overflow).
+    var dummy: [1]u8 = .{0};
+    const huge = @as([*]const u8, &dummy)[0 .. @as(usize, frame.MAX_PAYLOAD_SIZE) + 1];
+    try std.testing.expect(!rb.write(huge, 1));
+
+    // A length near 4 GB previously overflowed u32 in alignedFrameLength.
+    const near_4g = @as([*]const u8, &dummy)[0 .. (@as(usize, 1) << 32) - 4];
+    try std.testing.expect(!rb.write(near_4g, 1));
 }
 
 test "wrap-around" {

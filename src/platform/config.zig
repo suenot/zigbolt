@@ -30,16 +30,23 @@ pub const default_ring_capacity: usize = 1 << 16;
 /// Number of term buffers (triple-buffered).
 pub const default_num_terms: usize = 3;
 
-/// Nanosecond timestamp using the most accurate source available.
+/// Wall-clock timestamp in nanoseconds since the Unix epoch.
+/// NOT monotonic: subject to NTP slew/steps and manual clock changes.
+/// Use this for market-data / event timestamps that must be comparable
+/// across hosts; use `monotonicNs()` for latency and duty-cycle math.
 pub inline fn timestampNs() u64 {
-    if (is_macos) {
-        // mach_absolute_time is ~nanosecond resolution on Apple Silicon
-        return @intCast(std.time.nanoTimestamp());
-    } else if (is_linux) {
-        return @intCast(std.time.nanoTimestamp());
-    } else {
-        return @intCast(std.time.nanoTimestamp());
-    }
+    return @intCast(std.time.nanoTimestamp());
+}
+
+/// Monotonic timestamp in nanoseconds from an arbitrary origin.
+/// Backed by CLOCK_MONOTONIC — never goes backwards and is unaffected by
+/// wall-clock adjustments. Only the difference between two readings is
+/// meaningful; do not compare against `timestampNs()`.
+pub inline fn monotonicNs() u64 {
+    // CLOCK_MONOTONIC is always available on every platform this library
+    // targets (Linux, macOS), so the error path is unreachable.
+    const ts = std.posix.clock_gettime(.MONOTONIC) catch unreachable;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// Aligned size: rounds up `size` to the nearest multiple of `alignment`.
@@ -65,6 +72,15 @@ test "timestampNs is monotonic" {
     const t1 = timestampNs();
     const t2 = timestampNs();
     try std.testing.expect(t2 >= t1);
+}
+
+test "monotonicNs returns non-zero and is non-decreasing" {
+    const t1 = monotonicNs();
+    const t2 = monotonicNs();
+    const t3 = monotonicNs();
+    try std.testing.expect(t1 > 0);
+    try std.testing.expect(t2 >= t1);
+    try std.testing.expect(t3 >= t2);
 }
 
 test "alignUp basic cases" {

@@ -105,11 +105,11 @@ pub const MinFlowControl = struct {
     ) i64 {
         const position = computePosition(
             status.consumption_term_id,
-            status.consumption_term_offset,
+            status.consumption_term_offset, // kcov-skip: runs in every onStatusMessage (covered tests); no own line record
             position_bits_to_shift,
             initial_term_id,
         );
-        const window: i64 = @as(i64, status.receiver_window_length);
+        const window: i64 = @as(i64, status.receiver_window_length); // kcov-skip: runs in every onStatusMessage (covered tests); no own line record
         // Saturating: position near i64 max plus a window must not overflow.
         const limit_position = position +| window;
 
@@ -135,13 +135,13 @@ pub const MinFlowControl = struct {
             for (&self.receivers) |*r| {
                 if (!r.active) {
                     free_slot = r;
-                    break;
+                    break; // kcov-skip: taken whenever a new receiver claims a free slot (registration tests); branch carries no own line record
                 }
                 if (r.last_seen_ns < oldest.last_seen_ns) oldest = r;
             }
             const slot = free_slot orelse oldest;
             slot.* = .{
-                .receiver_id = status.receiver_id,
+                .receiver_id = status.receiver_id, // kcov-skip: runs on every new registration; literal field store folded, no own line record
                 .last_position = limit_position,
                 .last_seen_ns = now_ns,
                 .active = true,
@@ -229,7 +229,7 @@ pub const MaxFlowControl = struct {
 
         const position = computePosition(
             status.consumption_term_id,
-            status.consumption_term_offset,
+            status.consumption_term_offset, // kcov-skip: runs in every onStatusMessage (covered tests); no own line record
             position_bits_to_shift,
             initial_term_id,
         );
@@ -332,7 +332,7 @@ pub const TaggedFlowControl = struct {
             for (&self.receivers) |*r| {
                 if (!r.active) {
                     free_slot = r;
-                    break;
+                    break; // kcov-skip: taken whenever a new receiver claims a free slot (registration tests); branch carries no own line record
                 }
                 if (r.last_seen_ns < oldest.last_seen_ns) oldest = r;
             }
@@ -364,7 +364,7 @@ pub const TaggedFlowControl = struct {
         // no separate tag is supplied.
         return self.onStatusMessageTagged(
             status,
-            status.receiver_id,
+            status.receiver_id, // kcov-skip: wrapper argument line, executes in the tagged-dispatch test; no own line record
             sender_limit,
             initial_term_id,
             position_bits_to_shift,
@@ -938,7 +938,7 @@ test "TaggedFlowControl — re-registration updates position and tag" {
         .receiver_id = 5,
         .timestamp_ns = 1000,
     };
-    _ = fc.onStatusMessageTagged(first, 7, 0, 0, 16, 1000);
+    _ = fc.onStatusMessageTagged(first, 7, 0, 0, 16, 1000); // kcov-skip: test line; executes (the next assertions check its effects) but the discarded-result call gets no line record
     try std.testing.expectEqual(@as(u32, 1), fc.receiver_count);
     try std.testing.expect(fc.hasRequiredReceivers());
 

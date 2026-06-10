@@ -91,7 +91,7 @@ pub const IpcChannel = struct {
 
         const region = try memory.createShared(name, total_size, .{
             .use_hugepages = ipc_config.use_hugepages,
-            .pre_fault = ipc_config.pre_fault,
+            .pre_fault = ipc_config.pre_fault, // kcov-skip: runs on every create(); field store folded into the literal, no own line record
         });
 
         // Initialize metadata. The magic is published LAST with release
@@ -101,7 +101,7 @@ pub const IpcChannel = struct {
         const meta: *Metadata = @ptrCast(@alignCast(region.base));
         meta.* = .{
             .magic = 0,
-            .term_length = @intCast(tl),
+            .term_length = @intCast(tl), // kcov-skip: runs on every create(); field store folded into the literal, no own line record
         };
 
         if (ipc_config.pre_fault) {
@@ -177,7 +177,7 @@ pub const IpcChannel = struct {
 
         const payload_len: u32 = @intCast(data.len);
         const aligned_len = frame.alignedFrameLength(payload_len);
-        const tl: u32 = @intCast(self.term_length);
+        const tl: u32 = @intCast(self.term_length); // kcov-skip: runs on every publish(); no kcov hit record for this line on the aarch64 Debug build
 
         // Reject messages that can never fit in a single term.
         if (aligned_len > tl) return error.MessageTooLarge;
@@ -236,7 +236,7 @@ pub const IpcChannel = struct {
         // Commit: write header with release semantics via atomic store
         const hdr_len_ptr: *std.atomic.Value(i32) = @ptrCast(@alignCast(buf));
         const hdr_type_ptr: *i32 = @ptrCast(@alignCast(buf + 4));
-        hdr_type_ptr.* = msg_type_id;
+        hdr_type_ptr.* = msg_type_id; // kcov-skip: runs on every publish(); store merged with the adjacent header write, no own line record
         hdr_len_ptr.store(@intCast(payload_len), .release);
 
         // Advance tail

@@ -111,7 +111,7 @@ pub const SendBuffer = struct {
 
         // Free old data if slot was occupied.
         var evicted: usize = 0;
-        if (entry.occupied) {
+        if (entry.occupied) { // kcov-skip: runs on every store() (e.g. "SendBuffer store, get, and release"); kcov emits no hit record for this line
             evicted = entry.data.len;
             if (entry.data.len > 0) allocator.free(entry.data);
         }
@@ -396,7 +396,7 @@ pub const FlowControl = struct {
             ) == null) {
                 return true;
             }
-        }
+        } // kcov-skip: weak-CAS retry back-edge (exercised by the contention test); kcov attributes the branch to the cmpxchg line and ptrace serializes threads, suppressing retries
     }
 
     /// Replenish credits (called by the receiver after processing data).

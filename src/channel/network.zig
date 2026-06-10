@@ -399,7 +399,7 @@ pub const NetworkChannel = struct {
         // `max_retransmits_per_interval` payloads per interval, no matter
         // how many NAKs arrive.
         const now = config.monotonicNs();
-        if (now -| self.retransmit_window_start_ns >= self.config.retransmit_interval_ns) {
+        if (now -| self.retransmit_window_start_ns >= self.config.retransmit_interval_ns) { // kcov-skip: runs on every handleNak (retransmit tests); no own line record
             self.retransmit_window_start_ns = now;
             self.retransmit_tokens = self.config.max_retransmits_per_interval;
         }
@@ -646,6 +646,14 @@ const Delayed = struct {
     fn publish(ch: *NetworkChannel, data: []const u8) void {
         std.Thread.sleep(delay_ns);
         ch.publish(data, 1) catch {};
+    }
+
+    fn sendDataSeqs(att: *UdpChannel, addr: net.Address, comptime seqs: []const u64) void {
+        std.Thread.sleep(delay_ns);
+        var b: [128]u8 = undefined;
+        inline for (seqs) |seq| {
+            _ = att.send(buildDataPacket(&b, seq, "gap"), addr) catch {};
+        }
     }
 };
 
@@ -1245,26 +1253,19 @@ test "NetworkChannel NAKs the first contiguous gap and resets when it is filled"
     defer ch.deinit();
     const ch_addr = try boundAddress(ch.udp.socket_fd);
 
-    // Sequences 0, 3 and 5 arrive: 1, 2 and 4 are missing.
-    var b: [128]u8 = undefined;
-    _ = try peer.send(buildDataPacket(&b, 0, "s0"), ch_addr);
-    _ = try peer.send(buildDataPacket(&b, 3, "s3"), ch_addr);
-    _ = try peer.send(buildDataPacket(&b, 5, "s5"), ch_addr);
+    // One poll before any data exists: nothing is missing, so it emits
+    // only a heartbeat — queued at the peer AHEAD of the NAK, so the wait
+    // loop below has to skip over it.
+    _ = try ch.poll(testNoopHandler, 16);
 
-    for (0..200) |_| {
-        _ = try ch.poll(testNoopHandler, 16);
-        if (ch.recv_tracker.next_expected == 6) break;
-        std.Thread.sleep(100_000);
-    }
-    try std.testing.expectEqual(@as(u64, 6), ch.recv_tracker.next_expected);
-    // The NAK backoff tracks the leading gap.
-    try std.testing.expectEqual(@as(?u64, 1), ch.current_gap_from);
+    // Sequences 0, 3 and 5 (1, 2 and 4 missing) arrive after a delay.
+    const sender = try std.Thread.spawn(.{}, Delayed.sendDataSeqs, .{ &peer, ch_addr, &[_]u64{ 0, 3, 5 } });
 
     // The peer must receive a NAK for the FIRST contiguous gap only:
     // from_sequence 1, count 2 (sequence 4 is a separate gap).
     var rbuf: [512]u8 = undefined;
     var nak: ?reliability.NakMessage = null;
-    for (0..200) |_| {
+    for (0..400) |_| {
         _ = try ch.poll(testNoopHandler, 16);
         if (try peer.recv(&rbuf)) |r| {
             const type_byte = r.data[@offsetOf(reliability.NetworkHeader, "header_type")];
@@ -1277,30 +1278,36 @@ test "NetworkChannel NAKs the first contiguous gap and resets when it is filled"
                     r.data[reliability.NetworkHeader.SIZE..][0..@sizeOf(reliability.NakMessage)],
                 );
                 nak = nak_copy;
-                break;
             }
-            continue; // heartbeat — keep waiting
+            continue; // heartbeat (or a repeat NAK) — drain and keep going
         }
+        // Peer queue idle: done once the NAK was captured and every DATA
+        // datagram has been ingested (the NAK can outrun the last one).
+        if (nak != null and ch.recv_tracker.next_expected == 6) break;
         std.Thread.sleep(100_000);
     }
+    sender.join();
+    try std.testing.expectEqual(@as(u64, 6), ch.recv_tracker.next_expected);
+    // The NAK backoff tracks the leading gap.
+    try std.testing.expectEqual(@as(?u64, 1), ch.current_gap_from);
     try std.testing.expect(nak != null);
     try std.testing.expectEqual(@as(u32, 1), nak.?.session_id);
     try std.testing.expectEqual(@as(u32, 1), nak.?.stream_id);
     try std.testing.expectEqual(@as(u64, 1), nak.?.from_sequence);
     try std.testing.expectEqual(@as(u32, 2), nak.?.count);
 
-    // Retransmissions fill every gap: the NAK state must reset.
-    _ = try peer.send(buildDataPacket(&b, 1, "s1"), ch_addr);
-    _ = try peer.send(buildDataPacket(&b, 2, "s2"), ch_addr);
-    _ = try peer.send(buildDataPacket(&b, 4, "s4"), ch_addr);
+    // Retransmissions fill every gap (again delayed): the NAK state must
+    // reset once nothing is missing.
+    const filler = try std.Thread.spawn(.{}, Delayed.sendDataSeqs, .{ &peer, ch_addr, &[_]u64{ 1, 2, 4 } });
 
     var missing_scratch: [8]u64 = undefined;
-    for (0..200) |_| {
+    for (0..400) |_| {
         _ = try ch.poll(testNoopHandler, 16);
         if (ch.current_gap_from == null and
             ch.recv_tracker.getMissingInto(&missing_scratch) == 0) break;
         std.Thread.sleep(100_000);
     }
+    filler.join();
     try std.testing.expectEqual(@as(?u64, null), ch.current_gap_from);
     try std.testing.expectEqual(@as(usize, 0), ch.recv_tracker.getMissingInto(&missing_scratch));
 }
@@ -1371,6 +1378,6 @@ test "poll surfaces a hard transport error from recv" {
             got_error = true;
             break;
         }
-    }
+    } // kcov-skip: loop back-edge (the sleep iterations above are recorded); attributed to the loop body
     try std.testing.expect(got_error);
 }

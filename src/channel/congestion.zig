@@ -60,7 +60,7 @@ pub const RttEstimator = struct {
                 rtt_ns - self.srtt_ns;
 
             // RTTVAR = (3/4) * RTTVAR + (1/4) * |SRTT - R|
-            self.rttvar_ns = (self.rttvar_ns * 3 / 4) + (diff / 4);
+            self.rttvar_ns = (self.rttvar_ns * 3 / 4) + (diff / 4); // kcov-skip: runs on every non-first update() (RTT estimator tests); no own line record
 
             // SRTT = (7/8) * SRTT + (1/8) * R
             self.srtt_ns = (self.srtt_ns * 7 / 8) + (rtt_ns / 8);
@@ -239,9 +239,9 @@ pub const CongestionControl = struct {
     pub fn reset(self: *CongestionControl) void {
         const cfg = CongestionConfig{
             .initial_window = self.cwnd,
-            .max_window = self.max_window,
+            .max_window = self.max_window, // kcov-skip: runs in reset() (covered test); literal field stores folded, no own line record
             .min_window = self.min_window,
-            .mss = self.mss,
+            .mss = self.mss, // kcov-skip: runs in reset() (covered test); literal field stores folded, no own line record
             .initial_ssthresh = self.ssthresh,
         };
         _ = cfg;
@@ -251,7 +251,7 @@ pub const CongestionControl = struct {
             .initial_window = 64 * 1024,
             .max_window = self.max_window,
             .min_window = self.min_window,
-            .mss = self.mss,
+            .mss = self.mss, // kcov-skip: runs in reset() (covered test); literal field stores folded, no own line record
             .initial_ssthresh = 1024 * 1024,
         });
     }
@@ -336,7 +336,7 @@ pub const NakController = struct {
     /// saturating so a large base delay caps at u64 max instead of losing
     /// bits.
     pub fn currentDelay(self: *const NakController) u64 {
-        const shift: u6 = @intCast(@min(self.backoff_multiplier, 63));
+        const shift: u6 = @intCast(@min(self.backoff_multiplier, 63)); // kcov-skip: runs on every currentDelay() (NAK backoff tests); no own line record
         return self.base_delay_ns <<| shift;
     }
 };
@@ -675,7 +675,7 @@ test "NakController backoff shift is clamped at 63" {
     // shouldSendNak must not overflow last_nak_time + delay.
     nak.last_nak_time_ns = std.math.maxInt(u64) - 1;
     nak.nak_count = 0;
-    _ = nak.shouldSendNak(std.math.maxInt(u64));
+    _ = nak.shouldSendNak(std.math.maxInt(u64)); // kcov-skip: test line, executes in the passing clamp test; discarded-result call gets no line record
 }
 
 test "RTT estimator handles decreasing samples and exposes getters" {

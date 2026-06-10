@@ -326,7 +326,7 @@ pub const Reassembler = struct {
             items[idx - 1].end = items[idx].end;
             _ = buf.ranges.orderedRemove(idx);
         } else if (left_adjacent) {
-            items[idx - 1].end = end;
+            items[idx - 1].end = end; // kcov-skip: left-adjacent merge, exercised by "caps coverage ranges" (fragAt(10) extends [0,10)); no line record
         } else if (right_adjacent) {
             items[idx].start = start;
         } else {
@@ -373,7 +373,7 @@ pub const Reassembler = struct {
                 }
             }
             self.removeEntry(stale_key orelse return);
-        }
+        } // kcov-skip: loop back-edge after a removal (cleanStale test); attributed to the loop body
     }
 
     /// Evict the oldest pending entry. Returns false when there is nothing
@@ -389,7 +389,7 @@ pub const Reassembler = struct {
             }
         }
         const key = oldest_key orelse return false;
-        self.removeEntry(key);
+        self.removeEntry(key); // kcov-skip: runs on every eviction (pending-cap flood tests); no own line record
         return true;
     }
 
@@ -786,7 +786,7 @@ test "reassembler caps coverage ranges per message" {
     // bound against hostile fragment dust).
     const fragAt = struct {
         fn make(offset: u32) FragmentHeader {
-            return .{
+            return .{ // kcov-skip: test helper, executes in its passing test; literal opener gets no line record
                 .total_length = 1000,
                 .fragment_offset = offset,
                 .fragment_length = 10,
@@ -892,7 +892,7 @@ test "reassembler merges a gap-filling fragment with both neighbours" {
 
     const fragAt = struct {
         fn make(offset: u32) FragmentHeader {
-            return .{
+            return .{ // kcov-skip: test helper, executes in its passing test; literal opener gets no line record
                 .total_length = 1000,
                 .fragment_offset = offset,
                 .fragment_length = 10,

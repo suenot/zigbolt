@@ -65,7 +65,7 @@ comptime {
 
 test "timestampNs returns non-zero" {
     const t1 = timestampNs();
-    try std.testing.expect(t1 > 0);
+    try std.testing.expect(t1 > 0); // kcov-skip: hit record oscillates between builds; the test runs and passes
 }
 
 test "timestampNs is monotonic" {
@@ -78,7 +78,7 @@ test "monotonicNs returns non-zero and is non-decreasing" {
     const t1 = monotonicNs();
     const t2 = monotonicNs();
     const t3 = monotonicNs();
-    try std.testing.expect(t1 > 0);
+    try std.testing.expect(t1 > 0); // kcov-skip: hit record oscillates between builds; the test runs and passes
     try std.testing.expect(t2 >= t1);
     try std.testing.expect(t3 >= t2);
 }

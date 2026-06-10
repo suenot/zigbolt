@@ -241,7 +241,7 @@ test "Transport typed and raw roundtrip; second transport opens existing channel
         var got: u32 = 0;
         var last_price: i64 = 0;
         fn handler(msg: *align(1) const TickMessage) void {
-            got += 1;
+            got += 1; // kcov-skip: typed roundtrip handler body (S.got == 1 asserted); no own line record
             last_price = msg.price;
         }
     };

@@ -169,7 +169,7 @@ pub const DutyCycleTracker = struct {
 
     pub fn cycleEnd(self: *DutyCycleTracker, work_count: u32) void {
         const now = config.monotonicNs();
-        const elapsed = now -| self.cycle_start_ns;
+        const elapsed = now -| self.cycle_start_ns; // kcov-skip: runs on every cycleEnd (duty-cycle test asserts the stats); no own line record
         self.last_cycle_ns = elapsed;
         self.total_cycle_ns += elapsed;
         self.max_cycle_ns = @max(self.max_cycle_ns, elapsed);

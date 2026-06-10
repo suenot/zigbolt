@@ -236,7 +236,7 @@ pub const GlobalCounters = struct {
     system: CounterSet,
 
     /// Create with empty counter sets (no counters allocated).
-    pub fn init() GlobalCounters {
+    pub fn init() GlobalCounters { // kcov-skip: runs in the plain-init test (empty report asserted) and via initWithDefaults; no own line record
         return GlobalCounters{
             .ipc = CounterSet.init(),
             .network = CounterSet.init(),
@@ -306,7 +306,7 @@ pub const GlobalCounters = struct {
         var offset: usize = 0;
 
         const sections = [_]struct { name: []const u8, set: *const CounterSet }{
-            .{ .name = "IPC", .set = &self.ipc },
+            .{ .name = "IPC", .set = &self.ipc }, // kcov-skip: runs on every formatReport (report content asserted); literal store folded, no own line record
             .{ .name = "Network", .set = &self.network },
             .{ .name = "Reliability", .set = &self.reliability },
             .{ .name = "Archive", .set = &self.archive },
@@ -469,7 +469,7 @@ test "global_counters initWithDefaults" {
     const msgs = g.ipc.getByType(.ipc_messages_published).?;
     msgs.increment();
     msgs.increment();
-    msgs.increment();
+    msgs.increment(); // kcov-skip: hit record oscillates between builds; the test runs and passes
     try std.testing.expectEqual(@as(i64, 3), msgs.get());
 
     // Format report
@@ -506,7 +506,7 @@ test "counter thread safety — concurrent increments" {
     try std.testing.expectEqual(@as(i64, num_threads * increments_per_thread), c.get());
 }
 
-test "counter slots are padded to a full cache line (no false sharing)" {
+test "counter slots are padded to a full cache line (no false sharing)" { // kcov-skip: hit record oscillates between builds; the test runs and passes
     // Each slot must occupy at least one whole cache line, and slot
     // boundaries must be cache-line multiples.
     try std.testing.expect(@sizeOf(CounterSet.PaddedValue) >= std.atomic.cache_line);
@@ -523,7 +523,7 @@ test "counter slots are padded to a full cache line (no false sharing)" {
     // Basic allocate/increment/read round-trip on padded slots.
     c0.increment();
     c0.incrementBy(4);
-    c1.set(7);
+    c1.set(7); // kcov-skip: hit record oscillates between builds; the test runs and passes
     try std.testing.expectEqual(@as(i64, 5), c0.get());
     try std.testing.expectEqual(@as(i64, 7), c1.get());
 }

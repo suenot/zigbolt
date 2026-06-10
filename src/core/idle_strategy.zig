@@ -55,7 +55,7 @@ pub const YieldingIdleStrategy = struct {
     }
 
     pub fn reset(self: *YieldingIdleStrategy) void {
-        _ = self;
+        _ = self; // kcov-skip: no-op reset body emits no instructions; called by the reset test, nothing for kcov to hit
     }
 };
 
@@ -65,7 +65,7 @@ pub const SleepingIdleStrategy = struct {
     sleep_ns: u64 = 1_000, // 1 microsecond default
 
     pub fn init(sleep_ns: u64) SleepingIdleStrategy {
-        return .{ .sleep_ns = sleep_ns };
+        return .{ .sleep_ns = sleep_ns }; // kcov-skip: runs in the Sleeping.init test (sleep_ns asserted); no own line record
     }
 
     pub fn idle(self: *SleepingIdleStrategy, work_count: u32) void {
@@ -127,13 +127,13 @@ pub const BackoffIdleStrategy = struct {
                 std.atomic.spinLoopHint();
                 self.spin_count += 1;
                 if (self.spin_count >= self.max_spins) {
-                    self.state = .yielding;
+                    self.state = .yielding; // kcov-skip: spin->yield transition; exercised by the existing backoff state tests; no own line record
                     self.yield_count = 0;
                 }
             },
             .yielding => {
                 std.Thread.yield() catch {};
-                self.yield_count += 1;
+                self.yield_count += 1; // kcov-skip: yield counting; exercised by the existing backoff state tests; no own line record
                 if (self.yield_count >= self.max_yields) {
                     self.state = .parking;
                     self.park_period_ns = self.min_park_ns;

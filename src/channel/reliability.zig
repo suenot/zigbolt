@@ -612,6 +612,24 @@ test "RecvTracker slideWindow" {
     try std.testing.expectEqual(@as(u64, 2), tracker.bitmap_base);
 }
 
+test "RecvTracker drops a sequence that fell behind the window base" {
+    const allocator = std.testing.allocator;
+    var tracker = try RecvTracker.init(allocator, 64);
+    defer tracker.deinit();
+
+    _ = tracker.recordReceived(0);
+    _ = tracker.recordReceived(1);
+    _ = tracker.recordReceived(2);
+
+    // Slide the base forward past 0 and 1, then replay sequence 1. It is now
+    // strictly below bitmap_base — pre-history — so it is dropped outright,
+    // before the in-window bitmap is even consulted.
+    tracker.slideWindow(2);
+    const result = tracker.recordReceived(1);
+    try std.testing.expect(!result.accepted);
+    try std.testing.expectEqual(@as(?RecvTracker.GapInfo, null), result.gap);
+}
+
 test "RecvTracker window slides: gap still detected after > window_size messages" {
     const allocator = std.testing.allocator;
     const window: u64 = 64;

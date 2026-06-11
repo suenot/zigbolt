@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.optimize }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseFast]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.1
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.1
+
+      - name: Run unit tests
+        run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+
+  coverage:
+    name: coverage (kcov, x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.1
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.1
+
+      # kcov 43 from Debian trixie understands the LLVM-backend DWARF tables
+      # emitted under -Dcoverage. Pinning the image keeps the result
+      # reproducible regardless of the runner's apt kcov version.
+      - name: Build the kcov image
+        run: docker build -t zigbolt-kcov -f scripts/kcov.Dockerfile scripts
+
+      # Forces the LLVM backend (-Dcoverage) so kcov can parse the DWARF line
+      # table, then fails the job if measurable coverage drops below 100%.
+      - name: Measure coverage
+        env:
+          COVERAGE_MIN: "100"
+        run: ./scripts/coverage.sh
+
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage/merged/kcov-merged
+          if-no-files-found: ignore

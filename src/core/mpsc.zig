@@ -384,6 +384,31 @@ test "oversized message is rejected" {
     try std.testing.expect(!rb.write(near_4g, 1));
 }
 
+test "write is rejected when the ring is full (no wrap-around)" {
+    // A 24-byte payload is exactly a 32-byte frame (8B header + 24B payload),
+    // filling the whole ring; head lands back at offset 0. The next write fits
+    // before the wrap boundary (no padding) but there is no free space, so it
+    // is rejected by the no-wrap full check.
+    var rb = MpscRingBuffer(32).init();
+    const full: [24]u8 = @splat(0xAB);
+    try std.testing.expect(rb.write(&full, 1));
+    try std.testing.expect(!rb.write("xx", 2));
+}
+
+test "write is rejected when message plus wrap padding exceeds capacity" {
+    // Advance head to offset 16 by writing then consuming an 8-byte payload,
+    // leaving the ring empty but with head == tail == 16.
+    var rb = MpscRingBuffer(32).init();
+    try std.testing.expect(rb.write("AAAAAAAA", 1)); // 16B frame at offset 0
+    _ = rb.read() orelse return error.TestUnexpectedResult;
+
+    // A 16-byte payload needs a 24-byte frame. From offset 16 that requires
+    // 16 bytes of wrap padding + 24 = 40 > 32, so the write is rejected by the
+    // wrap-boundary full check even though the ring is otherwise empty.
+    const msg: [16]u8 = @splat(0xCD);
+    try std.testing.expect(!rb.write(&msg, 2));
+}
+
 test "wrap-around write and read" {
     // Use a small ring buffer to force wrapping.
     const cap = 64;

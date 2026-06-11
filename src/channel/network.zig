@@ -707,6 +707,34 @@ test "NetworkChannel publish with flow control" {
     try std.testing.expectError(error.BackPressured, result);
 }
 
+test "NetworkChannel back-pressures a fragmented message before any fragment hits the wire" {
+    const allocator = std.testing.allocator;
+    const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+
+    var ch = try NetworkChannel.init(allocator, .{
+        .udp = .{
+            .bind_address = bind_addr,
+            .non_blocking = true,
+            .remote_address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 9999),
+        },
+        .session_id = 1,
+        .stream_id = 1,
+        .send_buffer_capacity = 64,
+        .recv_window_size = 64,
+        .flow_control_window = 100, // far below the multi-fragment wire cost
+    });
+    defer ch.deinit();
+
+    // A 10000-byte payload needs several fragments; the up-front credit check
+    // (message bytes + one FragmentHeader per fragment) exceeds the 100-byte
+    // window, so publish fails before any fragment is sent.
+    const big = [_]u8{0xCD} ** 10000;
+    try std.testing.expect(ch.fragmenter.needsFragmentation(big.len));
+    try std.testing.expectError(error.BackPressured, ch.publish(&big, 1));
+    // No fragment was emitted: the sequence counter is untouched.
+    try std.testing.expectEqual(@as(u64, 0), ch.next_sequence);
+}
+
 test "NetworkChannel publish increments sequence" {
     const allocator = std.testing.allocator;
     const bind_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);

@@ -586,6 +586,19 @@ test "SparseIndex save removes the temp file when the rename fails" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("segment_0000000005.idx.tmp", .{}));
 }
 
+test "SparseIndex save rejects an entry count that overflows u32" {
+    var idx = SparseIndex.init(std.testing.allocator, 0, 1);
+    defer idx.deinit();
+    try idx.record(0, 0, 100, 1);
+
+    // Forge an impossible length: the u32 guard runs before any filesystem
+    // access, so no path is touched. Restore the real length before deinit.
+    const real_len = idx.entries.items.len;
+    idx.entries.items.len = @as(usize, std.math.maxInt(u32)) + 1;
+    defer idx.entries.items.len = real_len;
+    try std.testing.expectError(error.TooManyEntries, idx.save("/tmp/zigbolt_test_idx_overflow"));
+}
+
 test "SparseIndex rebuild releases the partial index when allocation fails" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -155,7 +155,7 @@ pub const Segment = struct {
         var meta_buf: [crc_size + record_header_size]u8 = undefined;
         const meta_bytes_read = try self.file.readAll(&meta_buf);
         if (meta_bytes_read < meta_buf.len) {
-            return error.CorruptRecord;
+            return error.CorruptRecord; // kcov-skip: line 142 already verified prefix+crc+header+payload all fit within file_size, so the in-process read always fills meta_buf; a short read here needs the file truncated concurrently via another fd, which cannot be injected single-threaded
         }
 
         const stored_crc = std.mem.readInt(u32, meta_buf[0..4], .little);
@@ -606,6 +606,45 @@ test "readRecord flags an undersized length prefix as corrupt" {
     const first = try seg.readRecord(0, &buf);
     try std.testing.expectEqualSlices(u8, "aaaa", first.?.record.payload);
     try std.testing.expectError(error.CorruptRecord, seg.readRecord(second_off, &buf));
+}
+
+test "readRecord treats a partial length prefix as end-of-segment" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var seg = try Segment.create(tmp_dir.dir, 0, 4096);
+    defer seg.close();
+
+    try seg.appendRecord(.{ .timestamp_ns = 1, .stream_id = 1, .msg_type_id = 1, .payload = "rec" });
+    var buf: [256]u8 = undefined;
+    const r1 = (try seg.readRecord(0, &buf)).?;
+
+    // Leave only 2 bytes after the first record — fewer than the 4-byte length
+    // prefix — as if the process crashed mid-prefix. The offset is still inside
+    // the file, so the EOF guard does not fire; the short prefix read does.
+    try seg.file.setEndPos(r1.next_offset + 2);
+    try std.testing.expect((try seg.readRecord(r1.next_offset, &buf)) == null);
+}
+
+test "readRecord rejects a length prefix claiming an oversized payload" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var seg = try Segment.create(tmp_dir.dir, 0, 1 << 40);
+    defer seg.close();
+
+    // Craft a length prefix whose decoded payload exceeds max_payload_size, then
+    // sparsely extend the file so the record does not run past EOF. The
+    // payload-size guard must reject it before any payload byte is touched.
+    const bad_total: u32 = record_overhead + @as(u32, @intCast(max_payload_size)) + 1;
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, bad_total, .little);
+    try seg.file.seekTo(0);
+    try seg.file.writeAll(&len_buf);
+    try seg.file.setEndPos(@as(u64, length_prefix_size) + bad_total);
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.CorruptRecord, seg.readRecord(0, &buf));
 }
 
 test "zero-length payload record roundtrips" {

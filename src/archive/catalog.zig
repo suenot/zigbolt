@@ -522,6 +522,54 @@ test "Catalog findByStream filtering" {
     try std.testing.expectEqual(@as(usize, 2), r2.len);
 }
 
+test "Catalog findByStream returns an empty slice when nothing matches" {
+    var cat = try Catalog.init(std.testing.allocator, "/tmp/zigbolt_test_cat_nomatch");
+    defer cat.deinit();
+
+    // A single non-mixed entry; querying a different stream matches nothing.
+    try cat.addEntry(.{
+        .segment_id = 0,
+        .start_offset = 0,
+        .end_offset = 100,
+        .start_timestamp_ns = 100,
+        .end_timestamp_ns = 200,
+        .stream_id = 7,
+        .record_count = 1,
+        .total_bytes = 10,
+        .closed = true,
+    });
+
+    // count == 0 takes the static empty-slice path. It is NOT allocator-owned,
+    // so it must not be freed.
+    const none = try cat.findByStream(42);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "Catalog save rejects an entry count that overflows u32" {
+    var cat = try Catalog.init(std.testing.allocator, "/tmp/zigbolt_test_cat_overflow");
+    defer cat.deinit();
+
+    try cat.addEntry(.{
+        .segment_id = 0,
+        .start_offset = 0,
+        .end_offset = 100,
+        .start_timestamp_ns = 100,
+        .end_timestamp_ns = 200,
+        .stream_id = 1,
+        .record_count = 1,
+        .total_bytes = 10,
+        .closed = true,
+    });
+
+    // Forge an impossible length: the u32 guard runs first in save() and returns
+    // before any entry is dereferenced. Restore the real length before deinit so
+    // the backing buffer is freed correctly.
+    const real_len = cat.entries.items.len;
+    cat.entries.items.len = @as(usize, std.math.maxInt(u32)) + 1;
+    defer cat.entries.items.len = real_len;
+    try std.testing.expectError(error.TooManyEntries, cat.save());
+}
+
 test "Catalog save and load from disk" {
     const test_path = "/tmp/zigbolt_test_cat_disk";
     std.fs.cwd().deleteTree(test_path) catch {};

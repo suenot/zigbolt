@@ -4,6 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // When measuring coverage natively (e.g. x86_64 Linux + kcov), force the
+    // LLVM backend for the test binaries. Zig's self-hosted x86_64 backend
+    // emits a DWARF5 line table whose file entries carry the vendor content
+    // type DW_LNCT_LLVM_source (0x2001); kcov's line parser doesn't understand
+    // it and silently extracts zero line records, reporting 0/0 coverage. The
+    // LLVM backend emits a standard file-name table that kcov parses correctly.
+    // Off by default so normal `zig build test` keeps the fast self-hosted path.
+    const coverage = b.option(bool, "coverage", "Build test binaries with the LLVM backend so kcov can parse DWARF line info") orelse false;
+    const test_backend: ?bool = if (coverage) true else null;
+
     // ── Library ──────────────────────────────────────────────
     const lib_mod = b.addModule("zigbolt", .{
         .root_source_file = b.path("src/root.zig"),
@@ -48,6 +58,7 @@ pub fn build(b: *std.Build) void {
     const t = b.addTest(.{
         .name = "root_tests",
         .root_module = test_mod,
+        .use_llvm = test_backend,
     });
     const run_t = b.addRunArtifact(t);
     test_step.dependOn(&run_t.step);
@@ -59,6 +70,7 @@ pub fn build(b: *std.Build) void {
     const ffi_tests = b.addTest(.{
         .name = "ffi_tests",
         .root_module = ffi_mod,
+        .use_llvm = test_backend,
     });
     const run_ffi_tests = b.addRunArtifact(ffi_tests);
     test_step.dependOn(&run_ffi_tests.step);

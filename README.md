@@ -43,7 +43,7 @@ ZigBolt is a young project. What is verified today:
 - **503 tests pass** via `zig build test`, in both Debug and ReleaseFast builds,
   on macOS and Linux.
 - **Line coverage is measured, not guessed**: 100% of measurable lines
-  (10278/10278; ~99.5% raw) via kcov on Linux, enforced in CI. The 203 audited
+  (10281/10281; ~99.5% raw) via kcov on Linux, enforced in CI. The 203 audited
   exclusions cover kcov attribution gaps and non-injectable OS-failure branches,
   each carrying an inline justification.
 - **The C-ABI shared library builds by default**: `zig build` produces
@@ -165,7 +165,7 @@ container `zigbolt-kcov`; on macOS it cross-compiles for `aarch64-linux-gnu`
 must be running. The GitHub Actions `coverage` job runs this on every push/PR
 and fails below 100% of measurable lines.
 
-Current state: 100% of measurable lines (10278/10278), ~99.5% raw. Lines
+Current state: 100% of measurable lines (10281/10281), ~99.5% raw. Lines
 excluded from measurement carry an inline `kcov-skip: <reason>` marker (kcov
 attribution gaps, OS-failure branches that cannot be injected in-process).
 

@@ -234,6 +234,17 @@ pub fn prefault(region: SharedRegion) void {
 
 // ── Tests ────────────────────────────────────────────────────
 
+// Read one byte through a volatile pointer. A plain `region.base[i]` load of
+// the *last* byte of a page-aligned mapping can be widened by the ReleaseFast
+// optimizer into a multi-byte load that runs past the mapping into the
+// unmapped guard page and faults (SIGSEGV). A volatile load is exact-width and
+// stays in bounds — the same reason prefault() touches pages through a
+// *volatile u8.
+fn readByteVolatile(base: [*]const u8, i: usize) u8 {
+    const p: *const volatile u8 = @ptrCast(&base[i]);
+    return p.*;
+}
+
 test "SharedRegion create and close" {
     const name = "/zigbolt_test_shm_create";
     var region = try createShared(name, 4096, .{});
@@ -296,8 +307,8 @@ test "createAnonymous region" {
     // Should be writable
     region.base[0] = 0x11;
     region.base[8191] = 0x22;
-    try std.testing.expectEqual(@as(u8, 0x11), region.base[0]);
-    try std.testing.expectEqual(@as(u8, 0x22), region.base[8191]);
+    try std.testing.expectEqual(@as(u8, 0x11), readByteVolatile(region.base, 0));
+    try std.testing.expectEqual(@as(u8, 0x22), readByteVolatile(region.base, 8191));
 }
 
 test "prefault does not crash" {
@@ -318,8 +329,8 @@ test "prefault preserves existing contents" {
     region.base[region.len - 1] = 0x5A;
     prefault(region);
 
-    try std.testing.expectEqual(@as(u8, 0xA5), region.base[0]);
-    try std.testing.expectEqual(@as(u8, 0x5A), region.base[region.len - 1]);
+    try std.testing.expectEqual(@as(u8, 0xA5), readByteVolatile(region.base, 0));
+    try std.testing.expectEqual(@as(u8, 0x5A), readByteVolatile(region.base, region.len - 1));
 }
 
 test "createShared rejects invalid names" {
@@ -405,6 +416,6 @@ test "createAnonymous honors a hugepage request with fallback" {
 
     region.base[0] = 0x77;
     region.base[region.len - 1] = 0x88;
-    try std.testing.expectEqual(@as(u8, 0x77), region.base[0]);
-    try std.testing.expectEqual(@as(u8, 0x88), region.base[region.len - 1]);
+    try std.testing.expectEqual(@as(u8, 0x77), readByteVolatile(region.base, 0));
+    try std.testing.expectEqual(@as(u8, 0x88), readByteVolatile(region.base, region.len - 1));
 }

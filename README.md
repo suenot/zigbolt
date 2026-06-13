@@ -1,7 +1,9 @@
 # ZigBolt -- Ultra-Low Latency Messaging for HFT
 
+[![CI](https://github.com/suenot/zigbolt/actions/workflows/ci.yml/badge.svg)](https://github.com/suenot/zigbolt/actions/workflows/ci.yml)
 [![Zig 0.15.1](https://img.shields.io/badge/Zig-0.15.1-orange)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Coverage](https://img.shields.io/badge/coverage-100%25%20measurable-brightgreen)](#measure-coverage)
 
 ZigBolt is a pure-Zig, zero-allocation, lock-free messaging library for
 high-frequency trading systems. Zero GC pauses, zero JVM safepoints, zero
@@ -38,11 +40,12 @@ runtime overhead.
 
 ZigBolt is a young project. What is verified today:
 
-- **494 tests pass** via `zig build test`, in both Debug and ReleaseFast builds,
+- **503 tests pass** via `zig build test`, in both Debug and ReleaseFast builds,
   on macOS and Linux.
-- **Line coverage is measured, not guessed**: 98.3% raw / 100% of measurable
-  lines (kcov on Linux; 204 audited exclusions for kcov attribution gaps and
-  non-injectable OS-failure branches, each with an inline justification).
+- **Line coverage is measured, not guessed**: 100% of measurable lines
+  (10281/10281; ~99.5% raw) via kcov on Linux, enforced in CI. The 203 audited
+  exclusions cover kcov attribution gaps and non-injectable OS-failure branches,
+  each carrying an inline justification.
 - **The C-ABI shared library builds by default**: `zig build` produces
   `zig-out/lib/libzigbolt.{dylib,so}` and `libzigbolt.a` with all 10 exports.
 - **All five language bindings** (C, Rust, Python, Go, TypeScript) build and
@@ -135,7 +138,7 @@ zig build
 zig build test
 ```
 
-Runs the full unit test suite (494 tests, including the FFI surface). The
+Runs the full unit test suite (503 tests, including the FFI surface). The
 suite passes in both Debug and ReleaseFast builds:
 
 ```bash
@@ -145,16 +148,26 @@ zig build test -Doptimize=ReleaseFast
 ### Measure Coverage
 
 ```bash
-./scripts/coverage.sh        # total + per-file percentages
-python3 scripts/uncovered.py # uncovered lines, with source text per file
+./scripts/coverage.sh                 # total + per-file percentages
+COVERAGE_MIN=100 ./scripts/coverage.sh # also fail if it regresses (used in CI)
+python3 scripts/uncovered.py          # uncovered lines, with source text per file
 ```
 
-kcov has no macOS support, so the script cross-compiles the test binaries for
-Linux (`zig build install-tests -Dtarget=aarch64-linux-gnu`) and runs them
-under kcov inside a Debian container — Docker must be running. Current state:
-98.3% raw, 100% of measurable lines. Lines excluded from measurement carry an
-inline `kcov-skip: <reason>` marker (kcov attribution gaps on aarch64 Debug
-builds, OS-failure branches that cannot be injected in-process).
+kcov has no macOS support and needs ptrace, so coverage is measured on Linux.
+The test binaries **must** be built with the LLVM backend: Zig 0.15.1's
+self-hosted x86_64 backend emits a DWARF5 line table whose file entries carry
+the vendor content type `DW_LNCT_LLVM_source` (0x2001), which kcov's line parser
+silently skips — reporting 0/0 coverage. `scripts/coverage.sh` handles this
+automatically: on Linux it builds with `zig build install-tests -Dcoverage`
+(forcing `use_llvm`) and runs kcov natively if installed, else in the Debian
+container `zigbolt-kcov`; on macOS it cross-compiles for `aarch64-linux-gnu`
+(cross builds already use LLVM) and runs under kcov in that container — Docker
+must be running. The GitHub Actions `coverage` job runs this on every push/PR
+and fails below 100% of measurable lines.
+
+Current state: 100% of measurable lines (10281/10281), ~99.5% raw. Lines
+excluded from measurement carry an inline `kcov-skip: <reason>` marker (kcov
+attribution gaps, OS-failure branches that cannot be injected in-process).
 
 ### Run Benchmarks
 

@@ -2,9 +2,9 @@
 
 ## Build & Test
 - `zig build` — build all targets
-- `zig build test` — run all unit tests (494; pass on macOS and Linux, Debug and ReleaseFast)
-- `./scripts/coverage.sh` — line coverage via kcov in a Linux Docker container (no kcov on macOS); `python3 scripts/uncovered.py` lists uncovered lines. Lines with a `kcov-skip: <reason>` marker are excluded from measurement — use only for kcov attribution gaps or non-injectable OS-failure branches, always with the justification inline
-- `zig build install-tests -Dtarget=aarch64-linux-gnu` — cross-compile test binaries without running (used by coverage.sh)
+- `zig build test` — run all unit tests (503; pass on macOS and Linux, Debug and ReleaseFast)
+- `./scripts/coverage.sh` — line coverage via kcov (100% of measurable lines); `COVERAGE_MIN=100 ./scripts/coverage.sh` fails if it regresses; `python3 scripts/uncovered.py` lists uncovered lines. Lines with a `kcov-skip: <reason>` marker are excluded from measurement — use only for kcov attribution gaps or non-injectable OS-failure branches, always with the justification inline
+- `zig build install-tests -Dcoverage` — build test binaries (without running) with the LLVM backend so kcov can parse the DWARF line table. REQUIRED for native x86_64 coverage: Zig 0.15.1's self-hosted x86_64 backend emits a DWARF5 file entry with content type `DW_LNCT_LLVM_source` (0x2001) that kcov silently skips, reporting 0/0. coverage.sh sets this automatically on Linux; macOS cross-compiles (`-Dtarget=aarch64-linux-gnu`, which already uses LLVM) and runs under kcov in a Docker container
 - `zig build bench` — run the FULL benchmark suite (bench/run_all.zig; writes bench/results.json)
 - `./zig-out/bin/bench_ping_pong` — IPC ping-pong (RTT) benchmark
 - `./zig-out/bin/bench_throughput` — throughput benchmark
